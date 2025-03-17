@@ -1,5 +1,6 @@
 import numpy as np
 import pygame
+import PySimpleGUI as sg
 import time
 import gymnasium as gym
 from gymnasium import spaces
@@ -8,7 +9,7 @@ from actions import dict_actions
 
 # init variables for pygame
 FPS = 3
-VIEWPORT_W = 900
+VIEWPORT_W = 1150
 VIEWPORT_H = 420
 
 class Ingredient:
@@ -64,14 +65,17 @@ class SandwichMakingEnv(gym.Env):
         self.screen: pygame.Surface = None
         self.clock = None
         self.load_ingredients()
-        self.font = pygame.font.Font(None, size=30)
+        self.font = pygame.font.SysFont("calibri", size=16)
+        self.font.set_bold(True)
         
 
         # list of tuples with dictionaries describing each component state
         self.dict_ingredients = dict_ingredients
+        self.dict_actions = dict_actions
         self.action_space = spaces.Discrete(len(dict_actions))
         self.state = [0] * len(dict_ingredients) 
         self.performed_actions = set()
+        self.performed_actions_list = []
 
         self.high = np.array([
             2,  # number of plate states
@@ -139,6 +143,7 @@ class SandwichMakingEnv(gym.Env):
         super().reset(seed=seed)
         self.state = np.zeros(len(dict_ingredients), dtype=np.int32)
         self.performed_actions.clear()
+        self.performed_actions_list = []
         # reset the variables for the screen
         return self.state, {}
 
@@ -150,6 +155,7 @@ class SandwichMakingEnv(gym.Env):
         
         # add action into performed actions set
         self.performed_actions.add(action)
+        self.performed_actions_list.append(action)
 
         # update the state after the action is performed
         self.update_state(action)
@@ -367,6 +373,23 @@ class SandwichMakingEnv(gym.Env):
         # draw the two rect in bg
         pygame.draw.rect(self.screen, (167, 210, 221), (0, 195, 900, 60))
         pygame.draw.rect(self.screen, (255, 244, 223), (0, 245, 900, 175))
+
+        # draw the history of action box
+        pygame.draw.rect(self.screen, (255, 244, 223), (900, 0, 250, 420))
+        history_text = self.font.render("History of Actions", True, (106, 62, 32))
+        self.screen.blit(history_text, (960, 10))
+
+        text_font = pygame.font.SysFont("calibri", size=12)
+        action_count = 0;
+        history_y = 30
+        for action in self.performed_actions_list:
+            action_count += 1
+            text = text_font.render(f"{action_count}. {self.dict_actions[action]}", True, (106, 62, 32))
+            self.screen.blit(text, (920, history_y))
+            history_y += 15
+
+
+
         plate_y = 330
         
         # draw the rest of the ingredients
@@ -393,14 +416,13 @@ class SandwichMakingEnv(gym.Env):
         self.clock.tick(FPS)
         pygame.display.flip()
         pass
-        # Create/Visualize the sandwich environment through PyGame
-        
-    
-    def get_state_description(self):
-        return [
-            self.dict_ingredients[i][val] for i, val in enumerate(self.state)
-        ]
-    
+
+def controlled_delay(delay_time):
+    """Non-blocking delay while keeping pygame responsive."""
+    start_time = pygame.time.get_ticks()
+    while pygame.time.get_ticks() - start_time < delay_time:
+        pygame.event.pump()  # Keeps event queue active to prevent freezing
+
 if __name__ == "__main__":
     env = SandwichMakingEnv()
     obs, _ = env.reset()
@@ -412,8 +434,9 @@ if __name__ == "__main__":
         obs, _, done, _, info = env.step(action) #originally state, rewards, done, truncated, info
         if info == {}:
             env.render()
+            controlled_delay(3000)
         if done:
-            time.sleep(1)
+            time.sleep(3) # time delayed after the sandwich is done till the env close
     env.close()
     
     # interface for the task 
