@@ -1,7 +1,7 @@
 import numpy as np
 import pygame
-import PySimpleGUI as sg
 import time
+import random
 import gymnasium as gym
 from gymnasium import spaces
 from d_ingredients import dict_ingredients
@@ -68,7 +68,6 @@ class SandwichMakingEnv(gym.Env):
         self.font = pygame.font.SysFont("calibri", size=16)
         self.font.set_bold(True)
         
-
         # list of tuples with dictionaries describing each component state
         self.dict_ingredients = dict_ingredients
         self.dict_actions = dict_actions
@@ -76,6 +75,7 @@ class SandwichMakingEnv(gym.Env):
         self.state = [0] * len(dict_ingredients) 
         self.performed_actions = set()
         self.performed_actions_list = []
+        self.ingredients_on_plate = []
 
         self.high = np.array([
             2,  # number of plate states
@@ -144,6 +144,7 @@ class SandwichMakingEnv(gym.Env):
         self.state = np.zeros(len(dict_ingredients), dtype=np.int32)
         self.performed_actions.clear()
         self.performed_actions_list = []
+        self.ingredients_on_plate = []
         # reset the variables for the screen
         return self.state, {}
 
@@ -214,20 +215,20 @@ class SandwichMakingEnv(gym.Env):
         """Update the environment state based on the action"""
         # mapping of actions to corresponding state indices
         action_to_state_index = {
-            0: 0,  # plate
-            1: 1,  2: 1,  # bottom bread
-            3: 2,  4: 2,         # regular mayo
-            5: 3,  6: 3,         # veggie mayo
-            7: 4,  8: 4,  9: 4, 10: 4, 11: 4,  # tomato
+            0: 0,                               # plate
+            1: 1,  2: 1,                        # bottom bread
+            3: 2,  4: 2,                        # regular mayo
+            5: 3,  6: 3,                        # veggie mayo
+            7: 4,  8: 4,  9: 4, 10: 4, 11: 4,   # tomato
             12: 5, 13: 5, 14: 5, 15: 5, 16: 5,  # avocado
-            17: 6, 18: 6,        # lettuce
+            17: 6, 18: 6,                       # lettuce
             19: 7, 20: 7, 21: 7, 22: 7, 23: 7,  # eggs
-            24: 8, 25: 8,  # ham
-            26: 9, 27: 9, 28: 9, # bacon
-            29: 10, 30: 10, 31: 10, # plant-based meat
-            32: 11, 33: 11,       # cheese
-            34: 12, 35: 12,       # pepper
-            36: 13, 37: 13        # top bread
+            24: 8, 25: 8,                       # ham
+            26: 9, 27: 9, 28: 9,                # bacon
+            29: 10, 30: 10, 31: 10,             # plant-based meat
+            32: 11, 33: 11,                     # cheese
+            34: 12, 35: 12,                     # pepper
+            36: 13, 37: 13                      # top bread
         }
         
         # check if action is mapped to a state index (safety check)
@@ -253,22 +254,25 @@ class SandwichMakingEnv(gym.Env):
             self.ingredients["plate"].update_pos(630, 250)
             self.ingredients["plate"].update_size(160, 160)
         elif action == 1:
-            self.ingredients["b_bread"].visible = True;
-            self.ingredients["bread"].visible = False;
+            self.ingredients["b_bread"].visible = True
+            self.ingredients["bread"].visible = False
         elif action == 2:
-            self.ingredients["b_bread"].on_plate = True;
+            self.ingredients["b_bread"].on_plate = True
+            self.ingredients_on_plate.append("b_bread")
         elif action == 3:
             self.ingredients["reg_mayo"].update_pos(800, 200)
         elif action == 4:
             self.ingredients["reg_mayo"].visible = False
             self.ingredients["reg_mayo_spr"].visible = True
             self.ingredients["reg_mayo_spr"].on_plate = True
+            self.ingredients_on_plate.append("reg_mayo_spr")
         elif action == 5:
             self.ingredients["v_mayo"].update_pos(830, 200)
         elif action == 6:
             self.ingredients["v_mayo"].visible = False
             self.ingredients["v_mayo_spr"].visible = True
             self.ingredients["v_mayo_spr"].on_plate = True
+            self.ingredients_on_plate.append("v_mayo_spr")
         elif action == 7: 
             self.ingredients["tomato"].update_pos(250, 220)
             self.ingredients["tomato"].update_size(100, 100)
@@ -280,8 +284,10 @@ class SandwichMakingEnv(gym.Env):
             self.ingredients["d_tomato"].visible = True
         elif action == 10: 
             self.ingredients["s_tomato"].on_plate = True
+            self.ingredients_on_plate.append("s_tomato")
         elif action == 11: 
             self.ingredients["d_tomato"].on_plate = True
+            self.ingredients_on_plate.append("d_tomato")
         elif action == 12: 
             self.ingredients["avocado"].update_pos(250, 310)
             self.ingredients["avocado"].update_size(100, 100)
@@ -293,13 +299,16 @@ class SandwichMakingEnv(gym.Env):
             self.ingredients["m_avocado"].visible = True
         elif action == 15: 
             self.ingredients["s_avocado"].on_plate = True
+            self.ingredients_on_plate.append("s_avocado")
         elif action == 16: 
             self.ingredients["m_avocado"].on_plate = True
+            self.ingredients_on_plate.append("m_avocado")
         elif action == 17: 
             self.ingredients["lettuce"].update_pos(360, 310)
             self.ingredients["lettuce"].update_size(120, 120)
         elif action == 18:
             self.ingredients["lettuce"].on_plate = True
+            self.ingredients_on_plate.append("lettuce")
         elif action == 19: 
             self.ingredients["eggs"].update_pos(20, 310)
             self.ingredients["eggs"].update_size(110, 110)
@@ -311,13 +320,16 @@ class SandwichMakingEnv(gym.Env):
             self.ingredients["f_egg_2"].visible = True
         elif action == 22: 
             self.ingredients["f_egg_1"].on_plate = True
+            self.ingredients_on_plate.append("f_egg_1")
         elif action == 23: 
             self.ingredients["f_egg_2"].on_plate = True
+            self.ingredients_on_plate.append("f_egg_2")
         elif action == 24: 
             self.ingredients["ham"].update_pos(370, 220)
             self.ingredients["ham"].update_size(120, 120)
         elif action == 25:
             self.ingredients["ham"].on_plate = True
+            self.ingredients_on_plate.append("ham")
         elif action == 26: 
             self.ingredients["r_bacon"].update_pos(150, 220)
             self.ingredients["r_bacon"].update_size(90, 90)
@@ -326,6 +338,7 @@ class SandwichMakingEnv(gym.Env):
             self.ingredients["f_bacon"].visible = True
         elif action == 28:
             self.ingredients["f_bacon"].on_plate = True
+            self.ingredients_on_plate.append("f_bacon")
         elif action == 29: 
             self.ingredients["r_pb_meat"].update_pos(150, 320)
             self.ingredients["r_pb_meat"].update_size(90, 90)
@@ -334,21 +347,26 @@ class SandwichMakingEnv(gym.Env):
             self.ingredients["f_pb_meat"].visible = True
         elif action == 31:
             self.ingredients["f_pb_meat"].on_plate = True
+            self.ingredients_on_plate.append("f_pb_meat")
         elif action == 32: 
             self.ingredients["cheese"].update_pos(475, 310)
             self.ingredients["cheese"].update_size(120, 120)
         elif action == 33:
             self.ingredients["cheese"].on_plate = True
+            self.ingredients_on_plate.append("cheese")
         elif action == 34:
             self.ingredients["pepper"].update_pos(780, 230)
         elif action == 35:
             self.ingredients["pepper_spr"].on_plate = True
+            self.ingredients_on_plate.append("pepper_spr")
         elif action == 36:
-            self.ingredients["t_bread"].visible = True;
+            self.ingredients["t_bread"].visible = True
         elif action == 37:
-            self.ingredients["t_bread"].on_plate = True;
+            self.ingredients["t_bread"].on_plate = True
+            self.ingredients_on_plate.append("t_bread")
         else:
             pass
+
 
     def is_done(self):
         if self.state[-1] == 2: #top bread placed
@@ -387,19 +405,18 @@ class SandwichMakingEnv(gym.Env):
             text = text_font.render(f"{action_count}. {self.dict_actions[action]}", True, (106, 62, 32))
             self.screen.blit(text, (920, history_y))
             history_y += 15
-
-
-
-        plate_y = 330
         
-        # draw the rest of the ingredients
+        # draw the ingredients (not on plate)
         for ingredient in self.ingredients:
             if self.ingredients[ingredient].visible:
-                if self.ingredients[ingredient].on_plate:
-                    self.ingredients[ingredient].draw_on_plate(self.screen, plate_y)
-                    plate_y -= 5
-                else:   
+                if not self.ingredients[ingredient].on_plate:
                     self.ingredients[ingredient].draw(self.screen)
+        
+        # draw the ingredients (on plate) in order
+        plate_y = 330
+        for ingredient in self.ingredients_on_plate:
+            self.ingredients[ingredient].draw_on_plate(self.screen, plate_y)
+            plate_y -= 5
         # self.ingredients["b_bread"].pos = (self.ingredients["b_bread"].pos[0] + 5, self.ingredients["b_bread"].pos[1])
         # self.screen.blit(self.ingredients["b_bread"].img, self.ingredients["b_bread"].pos)
         # self.screen.blit(self.ingredients["t_bread"].img, self.ingredients["t_bread"].pos)
@@ -418,7 +435,7 @@ class SandwichMakingEnv(gym.Env):
         pass
 
 def controlled_delay(delay_time):
-    """Non-blocking delay while keeping pygame responsive."""
+    """non-blocking delay while keeping pygame responsive """
     start_time = pygame.time.get_ticks()
     while pygame.time.get_ticks() - start_time < delay_time:
         pygame.event.pump()  # Keeps event queue active to prevent freezing
@@ -428,28 +445,33 @@ if __name__ == "__main__":
     obs, _ = env.reset()
     done = False
 
-    while not done:
-        
-        action = env.action_space.sample() #change to robot policy later
-        obs, _, done, _, info = env.step(action) #originally state, rewards, done, truncated, info
-        if info == {}:
-            env.render()
-            controlled_delay(3000)
-        if done:
-            time.sleep(3) # time delayed after the sandwich is done till the env close
-    env.close()
-    
-    # interface for the task 
-    # other class interface 
+    try:
+        while not done:
+            action = env.action_space.sample()  # Change to robot policy later
+            needs_help = random.random() < 0.25
+            # if needs_help:
+            #     env.render()
+                # action = env.get_help
+            # if needs_help:
+            #     action = dict_actions[open_action_gui()]  # GUI interaction for action selection
 
-    # two version of step 
-    # UI, may need some other stuffs on the keyboards 
+            obs, _, done, _, info = env.step(action)  # originally state, rewards, done, truncated, info
+            if info == {}:
+                env.render()
+                controlled_delay(1000)  # Wait for 1 second between each step
 
+    except Exception as e:
+        print(f"Error occurred: {e}")
 
-# write the update for each object - how each action correspond to a update - can only hardccode?
-#according to state, update x, y, size, and visibility
-#in render just draw only
-# see what reset needs to update
-# if invalid -> don't render
+    finally:
+        controlled_delay(3000)  # give time to see final state before closing
+        env.close()  # Close the Gym environment
+        del env  # Explicitly delete the environment
+
+        # Ensure pygame quits properly
+        if pygame.get_init():
+            pygame.quit()
+
+        print("Environment closed successfully.")
 
 
