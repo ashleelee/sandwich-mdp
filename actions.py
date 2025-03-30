@@ -48,7 +48,7 @@ dict_actions = {
     27: "Fry bacon",
     28: "Place bacon",
 
-    29: "Take plant-based meat out of fridge", 
+    29: "Take plant-based meat out", 
     30: "Fry plant-based meat",
     31: "Place plant-based meat",
 
