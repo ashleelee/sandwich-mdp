@@ -4,7 +4,7 @@ dict_actions = {
 
     # bottom bread
     1: "Take bottom bread out of bag",
-    2: "Place bottom bread on the plate",
+    2: "Place bottom bread on plate",
 
     # regular mayo
     3: "Take regular mayo dressing",

@@ -6,6 +6,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from d_ingredients import dict_ingredients
 from actions import dict_actions
+import json
 
 # init variables for pygame
 FPS = 30
@@ -74,6 +75,7 @@ class SandwichMakingEnv(gym.Env):
         self.load_ingredients()
         self.font = pygame.font.SysFont("calibri", size=16)
         self.font.set_bold(True)
+        self.episode_num = 1;
         
         # list of tuples with dictionaries describing each component state
         self.dict_ingredients = dict_ingredients
@@ -151,11 +153,23 @@ class SandwichMakingEnv(gym.Env):
         
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+
+        if options is None:
+            options = {}
+        self.episode_num = options.get("episode_num", 0) + 1
+
         self.state = np.zeros(len(dict_ingredients), dtype=np.int32)
         self.performed_actions.clear()
         self.performed_actions_list = []
         self.ingredients_on_plate = []
+
         # reset the variables for the screen
+        self.load_ingredients()
+        self.help_buttons = []
+        self.update_help_button()
+
+        self.done = False
+        
         return self.state, {}
 
     def step(self, action):
@@ -392,6 +406,7 @@ class SandwichMakingEnv(gym.Env):
 
     def is_done(self):
         if self.state[-1] == 2: #top bread placed
+            self.done = True
             return True
         return False
     
@@ -438,7 +453,7 @@ class SandwichMakingEnv(gym.Env):
                     if self.interfere_button.collidepoint(mouse_pos):
                         return True  # if clicked, go to help mode
 
-            if elapsed_time > 5000:  # if 5 seconds pass, exit interfere mode
+            if elapsed_time > 2000:  # if 5 seconds pass, exit interfere mode
                 return False
 
     def render(self, screen="help"):
@@ -492,6 +507,12 @@ class SandwichMakingEnv(gym.Env):
         self.screen.blit(robot_img, (1090, 10))
         self.screen.blit(speech_img, (1135, -20))
         pygame.draw.rect(self.screen, (242, 204, 141), (1070, 90, 250, 600))
+
+        # draw the episode
+        episode_font = pygame.font.SysFont("calibri", size=16)
+        episode_font.set_bold(True)
+        episode_text = episode_font.render(f"Episode: {self.episode_num}", True, (106, 62, 32))
+        self.screen.blit(episode_text, (20, 20))
         
         if(screen == "help"):
             help_font = pygame.font.SysFont("calibri", size=16)
@@ -520,6 +541,12 @@ class SandwichMakingEnv(gym.Env):
             progress_text_2 = progress_font.render("to interfere?", True, (106, 62, 32))
             self.screen.blit(progress_text_1, (1177, 35))
             self.screen.blit(progress_text_2, (1180, 55))
+        elif (self.done):
+            progress_font = pygame.font.SysFont("calibri", size=16)
+            progress_text_1 = progress_font.render("Episode", True, (106, 62, 32))
+            progress_text_2 = progress_font.render("complete!", True, (106, 62, 32))
+            self.screen.blit(progress_text_1, (1185, 35))
+            self.screen.blit(progress_text_2, (1185, 55))
         else:
             progress_font = pygame.font.SysFont("calibri", size=16)
             progress_text_1 = progress_font.render("Processing", True, (106, 62, 32))
@@ -536,60 +563,124 @@ def controlled_delay(delay_time):
     while pygame.time.get_ticks() - start_time < delay_time:
         pygame.event.pump()  # keep event queue active to prevent freezing
 
+
+# classes for logging data
+class Step:
+    def __init__(self, step_id, state_before, action, state_after, context, robot_prediction):
+        self.step_id = step_id
+        self.state_before = [int(x) for x in state_before]
+        self.action = int(action)
+        self.state_after = [int(x) for x in state_after]
+        self.context = context  # "robot_independent", "robot_asked", or "human_intervened"
+        self.robot_prediction = None if context == "robot_independent" else int(robot_prediction)
+        
+        
+        # self.human_correction = human_correction
+
+    def to_dict(self):
+        return self.__dict__
+
+
+class Episode:
+    def __init__(self, episode_id):
+        self.episode_id = episode_id
+        self.steps = []
+
+    def add_step(self, step):
+        self.steps.append(step)
+
+    def to_dict(self):
+        return {
+            "episode_id": self.episode_id,
+            "steps": [step.to_dict() for step in self.steps]
+        }
+
+    def save_to_json(self, filename):
+        with open(filename, "w") as f:
+            # json.dump(self.to_dict(), f, indent=4)
+            json.dump(
+                self.to_dict(),
+                f,
+                indent=4,  # Keep overall structure readable
+                separators=(",", ": "),  # Add spacing for readability
+                ensure_ascii=False
+            )
+            # json.dump(self.to_dict(), f, separators=(",", ":"), ensure_ascii=False)
+
+
 if __name__ == "__main__":
+    num_episodes = int(input("Enter number of episodes: "))
+
     env = SandwichMakingEnv()
-    obs, _ = env.reset()
-    done = False
-    screen_state = "process_action"
-    info = {}
-    need_new_action = True
-
     try:
-        while not done:
-            if need_new_action:
-                action = env.action_space.sample()
-                while(env.is_valid_action(action) == False):
-                    env.render(screen_state)
+        for episode_num in range(num_episodes):
+            obs, _ = env.reset(options={"episode_num": episode_num})
+            done = False
+            screen_state = "process_action"
+            info = {}
+            need_new_action = True
+            episode = Episode(episode_num)
+            step_id = 0
+
+            while not done:
+                if need_new_action:
                     action = env.action_space.sample()
-                needs_help = random.random() < 0.50
+                    while(env.is_valid_action(action) == False):
+                        env.render(screen_state)
+                        action = env.action_space.sample()
+                    needs_help = random.random() < 0.50
+                    robot_prediction = action; # save robot predicted action
+                    step_id += 1
 
-                if needs_help:
-                    screen_state = "help"
-                else:
-                    screen_state = "interfere"
-                need_new_action = False
-            
-            if screen_state == "interfere":
-                env.render("interfere")
-                interfere_status = env.handle_interfere() 
-                if interfere_status == True:
-                    screen_state = "help"
-                else:
-                    screen_state = "process_action"
+                    if needs_help:
+                        context = "robot_asked"
+                        screen_state = "help"
+                    else:
+                        context = "robot_independent"
+                        screen_state = "interfere"
+                    need_new_action = False
+                
+                if screen_state == "interfere":
+                    env.render("interfere")
+                    interfere_status = env.handle_interfere() 
+                    if interfere_status == True:
+                        context = "human_intervened"
+                        screen_state = "help"
+                    else:
+                        screen_state = "process_action"
 
-            if screen_state == "help":
-                env.render(screen_state)
-                action = env.get_help()
-                if action != None:
-                    screen_state = "process_action"
-
-            if screen_state == "process_action":
-                obs, _, done, _, info = env.step(action)  # originally state, rewards, done, truncated, info
-                # save the state (before & after), action itself, context
-                # context = ["robot independent", "robot asked", "human intervened"]
-                # if == robot asked/human intervened, save robot prediction & human correction
-                if info == {}:
-                    
+                if screen_state == "help":
                     env.render(screen_state)
-                    controlled_delay(2000)  # Wait for 1 second between each step
-                    
-                need_new_action = True
+                    action = env.get_help()
+                    if action != None:
+                        screen_state = "process_action"
+
+                if screen_state == "process_action":
+                    state_before = obs.copy()
+                    obs, _, done, _, info = env.step(action)  # originally state, rewards, done, truncated, info
+                    state_after = obs.copy()
+                    # log info here
+                    step = Step(step_id, state_before, action, state_after, context, robot_prediction)
+                    episode.add_step(step)
+                    if info == {}:
+                        env.render(screen_state)
+                        controlled_delay(2000)  # Wait for 2 second between each step
+                        
+                    need_new_action = True
+            
+            episode_filename = f"episode_{episode_num + 1}.json"
+            episode.save_to_json(episode_filename)
+            print(f"Saved: {episode_filename}")
+    
+            print(f"Episode {episode_num + 1} ended.")
+            controlled_delay(3000)  # delay before starting new episode
+
 
     except Exception as e:
         print(f"Error occurred: {e}")
 
     finally:
-        controlled_delay(3000)  # give time to see final state before closing
+        print("All episodes completed. Closing environment.")
         env.close()  # Close the Gym environment
         del env  # Explicitly delete the environment
 
@@ -600,17 +691,4 @@ if __name__ == "__main__":
         print("Environment closed successfully.")
 
 
-# restart - input(num of episode), opening window of, on episode ___
-# extend user interfering 5 seconds, counting 
-# output could be invalid
-# logging - state of env of every episode, aciton proposed by the robot, human interfere - , what action gets executed, 
-    # who executed
-# data logger set - pytorch data set, --> each episode (is an object)
-# class - replay buffer, episode, (all the episode)
-# class - replay (for whole data set), episode ()
 
-# initial script: synthetic data generation script
-# function taking in user preferences (e.g. egg sandwich) -> generate possible sequences
-    # key word bank - egg, ham, tomato, veggie, plant-based meat, bacon -> k arbitrary sequences (sample episode, same data structure)
-    # change the sample function, constrain such as plate - then bread - action always be egg afterwards -> always put the ingredient onto it after it's taken out -> 20-25
-# set of user preferences, some pr
