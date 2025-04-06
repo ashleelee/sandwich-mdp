@@ -7,6 +7,7 @@ from gymnasium import spaces
 from d_ingredients import dict_ingredients
 from actions import dict_actions
 import json
+import pickle
 
 # init variables for pygame
 FPS = 30
@@ -597,7 +598,6 @@ class Episode:
 
     def save_to_json(self, filename):
         with open(filename, "w") as f:
-            # json.dump(self.to_dict(), f, indent=4)
             json.dump(
                 self.to_dict(),
                 f,
@@ -605,12 +605,12 @@ class Episode:
                 separators=(",", ": "),  # Add spacing for readability
                 ensure_ascii=False
             )
-            # json.dump(self.to_dict(), f, separators=(",", ":"), ensure_ascii=False)
+            
 
 
 if __name__ == "__main__":
     num_episodes = int(input("Enter number of episodes: "))
-
+    all_episodes = []
     env = SandwichMakingEnv()
     try:
         for episode_num in range(num_episodes):
@@ -620,7 +620,7 @@ if __name__ == "__main__":
             info = {}
             need_new_action = True
             episode = Episode(episode_num)
-            step_id = 0
+            step_id = -1
 
             while not done:
                 if need_new_action:
@@ -668,11 +668,12 @@ if __name__ == "__main__":
                         
                     need_new_action = True
             
-            episode_filename = f"episode_{episode_num + 1}.json"
-            episode.save_to_json(episode_filename)
-            print(f"Saved: {episode_filename}")
-    
-            print(f"Episode {episode_num + 1} ended.")
+            # episode_filename = f"episode_{episode_num + 1}.json"
+            # episode.save_to_json(episode_filename)
+            # print(f"Saved: {episode_filename}")
+
+            all_episodes.append(episode)
+            print(f"Episode {episode_num} ended.")
             controlled_delay(3000)  # delay before starting new episode
 
 
@@ -680,6 +681,11 @@ if __name__ == "__main__":
         print(f"Error occurred: {e}")
 
     finally:
+        with open("all_episodes.pkl", "wb") as f:
+            pickle.dump(all_episodes, f)
+
+        print("All episodes saved to all_episodes.pkl")
+
         print("All episodes completed. Closing environment.")
         env.close()  # Close the Gym environment
         del env  # Explicitly delete the environment
