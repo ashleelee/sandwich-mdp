@@ -28,7 +28,7 @@ class Episode:
         }
 
 # load the data
-with open("all_episodes_gen.pkl", "rb") as f:
+with open("all_episodes.pkl", "rb") as f:
     all_episodes = pickle.load(f)
 
 
@@ -70,8 +70,8 @@ plt.plot(episodes, intervened, label="Human Intervened")
 plt.xlabel("Episode Number")
 plt.ylabel("Percentage of Steps (%)")
 plt.title("Intervention Types per Episode")
-# plt.xticks(episodes) 
-plt.xticks(ticks=range(0, len(episodes)+1, 5)) 
+plt.xticks(episodes) 
+# plt.xticks(ticks=range(0, len(episodes)+1, 5)) 
 plt.legend()
 plt.grid(True)
 plt.tight_layout()

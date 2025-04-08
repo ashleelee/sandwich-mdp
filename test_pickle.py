@@ -41,5 +41,5 @@ class Episode:
 with open("all_episodes.pkl", "rb") as f:
     episodes = pickle.load(f)
 
-print(len(episodes))  # Total number of episodes
-print(episodes[0].steps[0].state_after)  # First step of the first episode
+print(len(episodes))  # total number of episodes
+print(episodes[0].steps[0].state_after)  # first step of the first episode
