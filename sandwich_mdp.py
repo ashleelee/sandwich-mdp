@@ -9,6 +9,17 @@ from actions import dict_actions
 import json
 import pickle
 
+import torch
+from policies.conformal.mlp import Discrete_Policy 
+
+
+# init for policy
+N_action_classes = 38
+state_dim = len(dict_ingredients) 
+discrete_policy = Discrete_Policy(state_dim=state_dim, output_dim=N_action_classes)
+discrete_policy.load_state_dict(torch.load('discrete_policy.pth'))
+discrete_policy.eval()
+
 # init variables for pygame
 FPS = 30
 VIEWPORT_W = 1330
@@ -574,9 +585,6 @@ class Step:
         self.state_after = [int(x) for x in state_after]
         self.context = context  # "robot_independent", "robot_asked", or "human_intervened"
         self.robot_prediction = None if context == "robot_independent" else int(robot_prediction)
-        
-        
-        # self.human_correction = human_correction
 
     def to_dict(self):
         return self.__dict__
@@ -628,7 +636,15 @@ if __name__ == "__main__":
                     while(env.is_valid_action(action) == False):
                         env.render(screen_state)
                         action = env.action_space.sample()
-                    needs_help = random.random() < 0.50
+                        # state = obs 
+                        # state_tensor = torch.tensor(np.array(state)).float().unsqueeze(0)  # (1, state_dim)
+                        # with torch.no_grad():
+                        #     logits = discrete_policy(state_tensor)
+                        #     action = logits.argmax(dim=1).item()
+
+                            # helper function
+
+                    needs_help = random.random() < 0.3
                     robot_prediction = action; # save robot predicted action
                     step_id += 1
 

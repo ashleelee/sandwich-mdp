@@ -7,7 +7,7 @@ from torch.utils.data import TensorDataset
 from torch.utils.data import random_split
 import pickle
 import pdb
-from data_parser import Step, Episode
+from data_classes import Step, Episode
 from policies.conformal.mlp import Discrete_Policy
 import matplotlib.pyplot as plt
 
