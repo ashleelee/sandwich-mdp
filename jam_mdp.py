@@ -8,6 +8,8 @@ import random
 # from jam_sample_actions import jam_sample_actions
 from jam_data_classes import TimeStep, Episode
 import os
+from policies.conformal.mlp import Continuous_Policy
+import torch, pdb
 
 # init variables for pygame
 FPS = 30
@@ -542,7 +544,7 @@ def create_syn_data(actions):
             f.write(f"    np.array({rounded}, dtype=np.float32),\n")
         f.write("]\n")
     
-if __name__ == "__main__":
+def main_scripted_path():
     num_episodes = int(input("Enter number of episodes to run: "))
     all_episodes = []
     pygame.init()
@@ -647,4 +649,217 @@ if __name__ == "__main__":
     if pygame.get_init():
         pygame.quit()
     
+    print("Environment closed successfully.")
+
+
+def get_prediction(obs,  obs_prev1, obs_prev2, policy_model):
+    min_X = np.array([np.float32(90.0), np.float32(78.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(
+        0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(
+        0.0), np.float32(92.0), np.float32(74.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(
+        0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(
+        0.0), np.float32(92.0), np.float32(74.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(
+        0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0)])
+    max_X = np.array([np.float32(573.0), np.float32(524.0), np.float32(1.0), np.float32(1.0), np.float32(0.25068787), np.float32(
+        0.075533986), np.float32(0.25659528), np.float32(0.6491279), np.float32(0.52741855), np.float32(
+        0.40159684), np.float32(0.40303788), np.float32(0.4491095), np.float32(573.0), np.float32(524.0), np.float32(
+        1.0), np.float32(1.0), np.float32(0.25068787), np.float32(0.075533986), np.float32(0.25659528), np.float32(
+        0.6491279), np.float32(0.52741855), np.float32(0.40159684), np.float32(0.40303788), np.float32(
+        0.4491095), np.float32(573.0), np.float32(524.0), np.float32(1.0), np.float32(1.0), np.float32(
+        0.25068787), np.float32(0.075533986), np.float32(0.25659528), np.float32(0.6491279), np.float32(
+        0.52741855), np.float32(0.40159684), np.float32(0.40303788), np.float32(0.4491095)])
+    min_Y = np.array([np.float32(136.0), np.float32(74.0), np.float32(0.0)])
+    max_Y = np.array([np.float32(573.0), np.float32(524.0), np.float32(1.0)])
+
+    input_obs = obs[6:]
+    input_obs_prev1 = obs_prev1[6:]
+    input_obs_prev2 = obs_prev2[6:]
+    input_obs = np.concatenate((input_obs_prev2, input_obs_prev1, input_obs), axis=0)
+    # normalize input_obs
+    input_obs = (input_obs - min_X) / (max_X - min_X)
+
+    state_tensor = torch.tensor(np.array(input_obs)).float().unsqueeze(0)
+    with torch.no_grad():
+        action_pred = policy_model(state_tensor)
+        # unnormalize action_pred
+        action_pred = action_pred.detach().numpy() * (max_Y - min_Y) + min_Y
+
+    return action_pred[0]
+
+if __name__ == "__main__":
+    num_episodes = int(input("Enter number of episodes to run: "))
+    all_episodes = []
+    pygame.init()
+    pygame.display.init()
+    env = JamSpreadingEnv()
+    action = None
+    context = None
+
+    # load policy
+    action_dim = 3
+    state_dim = 36
+    cont_policy = Continuous_Policy(state_dim=state_dim, output_dim=action_dim)
+    cont_policy.load_state_dict(torch.load('cont_policy.pth'))
+    cont_policy.eval()
+
+    for episode_num in range(num_episodes):
+        # actions = []
+        obs, _ = env.reset()
+        obs_prev1 = obs
+        obs_prev2 = obs
+        done = False
+        next_action_idx = 0
+        next_action = jam_sample_actions[next_action_idx]
+        help_start_time = None
+        screen_state = "robot"
+        last_help_check_time = time.time()
+        episode = Episode(episode_num)
+        step_id = 0
+
+        q_lo = np.array([0.1, 0.1, 0.1])
+        q_hi = np.array([0.1, 0.1, 0.1])
+        stepsize = 0.2
+        alpha_desired = 0.8
+        list_of_uncertainties = []
+        list_of_residuals = []
+        history_upper_residuals = []
+        history_lower_residuals = []
+        B_t_lookback_window = 100
+
+        while not done:
+
+            robot_prediction = get_prediction(obs, obs_prev1, obs_prev2, cont_policy)
+            print("robot_prediction", robot_prediction)
+
+            if screen_state == "robot":
+                
+                need_help = False
+                if time.time() - last_help_check_time >= 2.0:
+                    uncertainty_at_timestep = np.linalg.norm(q_hi + q_lo)
+                    print("uncertainty_at_timestep", uncertainty_at_timestep)
+                    need_help = uncertainty_at_timestep > 10
+
+                if env.check_intervene_click():
+                    screen_state = "ready"
+                    context = "human_intervened"
+                elif need_help:
+                    screen_state = "ready"
+                    context = "robot_asked"
+                else:
+                    action = robot_prediction
+                    context = "robot_independent"
+
+                    # takes the next action from the sample_actions list
+
+
+                    screen_state = "robot"
+
+            elif screen_state == "ready":
+                if env.ready_to_help():
+                    screen_state = "help"
+                    help_start_time = time.time()
+                else:
+                    env.render(episode_num, step_id, screen_state)
+                    time.sleep(1 / 10)
+                    continue
+
+            elif screen_state == "help":
+                # let human intervene
+                action = env.get_help()
+
+                # check if help time has expired (3 seconds)
+                if help_start_time and time.time() - help_start_time >= 3.0:
+                    # find nearest (x, y) in jam_sample_actions to robot position
+                    robot_x, robot_y = env.state[6], env.state[7]
+                    min_dist = float('inf')
+                    best_idx = next_action_idx  # fallback to current index
+
+                    for i in range(len(jam_sample_actions)):
+                        act_x, act_y = jam_sample_actions[i][0], jam_sample_actions[i][1]
+                        dist = ((act_x - robot_x) ** 2 + (act_y - robot_y) ** 2) ** 0.5
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_idx = i
+
+                    # set the new next_action to the closest
+                    next_action_idx = best_idx
+                    next_action = jam_sample_actions[next_action_idx]
+                    last_help_check_time = time.time()
+                    screen_state = "robot"
+
+                # pdb.set_trace()
+                expert_y = action
+                y_pred = robot_prediction
+                shi_upper_residual = expert_y - y_pred
+                slo_lower_residual = y_pred - expert_y
+                list_of_residuals.append(np.linalg.norm(abs(expert_y - y_pred)))
+
+                # # Check coverage, compute err_lo, err_hi
+                # if shi_upper_residual > q_hi, then err_hi = 1
+                # if slo_lower_residual > q_lo, then err_lo = 1
+                err_hi = np.zeros(action_dim)
+                err_lo = np.zeros(action_dim)
+                for i in range(action_dim):
+                    if shi_upper_residual[i] > q_hi[i]:
+                        err_hi[i] = 1
+                    if slo_lower_residual[i] > q_lo[i]:
+                        err_lo[i] = 1
+                print("err_hi", err_hi)
+                print("err_lo", err_lo)
+                covered = sum(err_hi) + sum(err_lo)
+                if covered > 0:
+                    covered = 0
+                else:
+                    covered = 1
+                print("covered", covered)
+
+                B_hi = np.ones(action_dim) * 0.01
+                B_lo = np.ones(action_dim) * 0.01
+
+                if len(history_upper_residuals) > 0:
+                    B_hi = np.max(history_upper_residuals, axis=0)
+                    B_lo = np.max(history_lower_residuals, axis=0)
+
+                # Append the current residuals to the history
+                history_upper_residuals.append(shi_upper_residual)
+                history_lower_residuals.append(slo_lower_residual)
+
+                # If the history is longer than the lookback window, pop the oldest residuals
+                if len(history_upper_residuals) > B_t_lookback_window:
+                    history_upper_residuals.pop(0)
+                    history_lower_residuals.pop(0)
+
+                # update quantile tracking parameters
+                q_hi = q_hi + (stepsize) * B_hi * (err_hi - alpha_desired)
+                q_lo = q_lo + (stepsize) * B_lo * (err_lo - alpha_desired)
+
+            obs_prev2 = obs_prev1
+            obs_prev1 = obs
+            if action is not None:
+                obs, _, done, _, _ = env.step(action)
+                img_path = f"jam_state_img/test/episode{episode_num}_step{step_id}.png"
+                timestep = TimeStep(
+                    step_id=step_id,
+                    action=action,
+                    state_v=obs,
+                    state_img_path=img_path,
+                    context=context,
+                    robot_prediction=robot_prediction
+                )
+                episode.add_step(timestep)
+
+
+
+            env.render(episode_num, step_id, screen_state)
+            step_id += 1
+            time.sleep(1 / 10)
+
+        print(f"Episode {episode_num} ended.")
+        controlled_delay(3000)
+
+    env.close()  # Close the Gym environment
+    del env  # Explicitly delete the environment
+
+    if pygame.get_init():
+        pygame.quit()
+
     print("Environment closed successfully.")

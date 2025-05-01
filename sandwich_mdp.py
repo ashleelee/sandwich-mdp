@@ -11,7 +11,8 @@ import pickle
 
 import torch
 from policies.conformal.mlp import Discrete_Policy 
-
+import pdb
+import matplotlib.pyplot as plt
 
 # init for policy
 N_action_classes = 38
@@ -592,6 +593,15 @@ def select_action_from_policy(obs, policy_model, dict_actions=None):
         print("potential valid action:", dict_actions[action])
     return action
 
+def select_action_from_policy_with_logits(obs, policy_model, dict_actions=None):
+    state_tensor = torch.tensor(np.array(obs)).float().unsqueeze(0)
+    with torch.no_grad():
+        logits = policy_model(state_tensor)
+        action = logits.argmax(dim=1).item()
+    if dict_actions:
+        print("potential valid action:", dict_actions[action])
+    return action, logits
+
 # classes for logging data
 class Step:
     def __init__(self, step_id, state_before, action, state_after, context, robot_prediction):
@@ -632,7 +642,7 @@ class Episode:
             
 
 
-if __name__ == "__main__":
+def main_default():
     num_episodes = int(input("Enter number of episodes: "))
     all_episodes = []
     env = SandwichMakingEnv()
@@ -722,4 +732,135 @@ if __name__ == "__main__":
         print("Environment closed successfully.")
 
 
+def main_conformaldagger():
+    num_episodes = int(input("Enter number of episodes: "))
+    all_episodes = []
+    env = SandwichMakingEnv()
+    try:
+        for episode_num in range(num_episodes):
+            obs, _ = env.reset(options={"episode_num": episode_num})
+            done = False
+            screen_state = "process_action"
+            info = {}
+            need_new_action = True
+            episode = Episode(episode_num)
+            step_id = -1
 
+            current_q = 0.5
+            stepsize = 0.2
+            desired_alpha = 0.8
+            list_of_uncertainties = []
+
+            while not done:
+                if need_new_action:
+                    # action = env.action_space.sample()
+                    action, action_logits = select_action_from_policy_with_logits(obs, discrete_policy, dict_actions)
+
+                    while (env.is_valid_action(action) == False):
+                        env.render(screen_state)
+                        action = env.action_space.sample()
+                    print("----------")
+
+                    needs_help = current_q > 0.7
+                    list_of_uncertainties.append(current_q)
+                    print("current_q ", current_q)
+
+                    robot_prediction = action;  # save robot predicted action
+                    step_id += 1
+
+                    if needs_help:
+                        context = "robot_asked"
+                        screen_state = "help"
+                    else:
+                        context = "robot_independent"
+                        screen_state = "interfere"
+                    need_new_action = False
+
+                if screen_state == "interfere":
+                    env.render("interfere")
+                    interfere_status = env.handle_interfere()
+                    if interfere_status == True:
+                        context = "human_intervened"
+                        screen_state = "human_intervening"
+                        # screen_state = "help"
+                    else:
+                        screen_state = "process_action"
+
+                if (screen_state == "help" or screen_state == "human_intervening"):
+                    env.render(screen_state)
+                    action = env.get_help()
+                    if action != None:
+                        screen_state = "process_action"
+
+                        human_action_idx = action
+                        predicted_logits = action_logits.squeeze(0).numpy()
+                        # logit_weight_of_human_action = predicted_logits[human_action_idx]
+                        # nonconformity score
+                        nonconformity_score = 0
+                        sorted_indices = np.argsort(predicted_logits)
+                        index = 0
+                        while index != human_action_idx:
+                            index += 1
+                            nonconformity_score += predicted_logits[sorted_indices[index]]
+
+                        if nonconformity_score < current_q:
+                            err_t = 1
+                        else:
+                            err_t = 0
+
+
+                        current_q = current_q + stepsize * (err_t - desired_alpha)
+
+
+
+
+
+
+                if screen_state == "process_action":
+                    state_before = obs.copy()
+                    obs, _, done, _, info = env.step(action)  # originally state, rewards, done, truncated, info
+                    state_after = obs.copy()
+                    # log info here
+                    step = Step(step_id, state_before, action, state_after, context, robot_prediction)
+                    episode.add_step(step)
+                    if info == {}:
+                        env.render(screen_state)
+                        controlled_delay(2000)  # Wait for 2 second between each step
+
+                    need_new_action = True
+
+            all_episodes.append(episode)
+            print(f"Episode {episode_num} ended.")
+            controlled_delay(3000)  # delay before starting new episode
+
+            plt.plot(list_of_uncertainties)
+            plt.xlabel("step")
+            plt.ylabel("uncertainty")
+            plt.show()
+
+
+
+
+
+    except Exception as e:
+        print(f"Error occurred: {e}")
+
+    finally:
+        with open("all_episodes.pkl", "wb") as f:
+            pickle.dump(all_episodes, f)
+
+        print("All episodes saved to all_episodes.pkl")
+
+        print("All episodes completed. Closing environment.")
+        env.close()  # Close the Gym environment
+        del env  # Explicitly delete the environment
+
+        # Ensure pygame quits properly
+        if pygame.get_init():
+            pygame.quit()
+
+        print("Environment closed successfully.")
+
+
+if __name__ == "__main__":
+    main_conformaldagger()
