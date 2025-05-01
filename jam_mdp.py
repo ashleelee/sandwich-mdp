@@ -62,7 +62,7 @@ class JamSpreadingEnv(gym.Env):
         self.action_log = []
 
         #delete later
-        self.save_interval = 3.0  # seconds
+        self.save_interval = 0.0  # seconds
         self.last_save_time = time.time()
         self.save_counter = 0
 
@@ -193,7 +193,7 @@ class JamSpreadingEnv(gym.Env):
         
         if self.state[8] == 1 and self.state[9] == 1:
             jam_point = (int(self.state[6] + 35), int(self.state[7] + 70))
-            if jam_point not in self.jam_lines: 
+            if jam_point not in self.jam_lines and not self.hit_bread_endpoints: 
                 self.jam_lines.append(jam_point)
                 self.update_jam_coverage_area()
     
@@ -330,7 +330,6 @@ class JamSpreadingEnv(gym.Env):
 
         distance = ((tip_x - bread_x) ** 2 + (tip_y - bread_y) ** 2) ** 0.5
         if distance <= 25:
-            print("hit!")
             self.hit_bread_endpoints = True
     
     def draw_robot(self):
@@ -401,9 +400,30 @@ class JamSpreadingEnv(gym.Env):
         text_rect = text_surf.get_rect(center=button_rect.center)
         self.screen.blit(text_surf, text_rect)
 
+    def draw_intervene_ready_text(self):
+        font = pygame.font.SysFont("Arial", 14, bold=True)
+        text_lines = [
+            "Please click on the dot on",
+            "the robot arm and guide",
+            "me with your cursor."
+        ]
+        color = (139, 69, 19)  # A brownish color similar to your image
+        x = 715  # Slightly indented inside the side panel
+        y_start = 300  # Start vertical position
+
+        for i, line in enumerate(text_lines):
+            text_surf = font.render(line, True, color)
+            text_rect = text_surf.get_rect(center=(x + 85, y_start + i * 30))  # center in the side panel
+            self.screen.blit(text_surf, text_rect)
+
+    def draw_episode_num(self, episode_num):
+        font = pygame.font.SysFont("Arial", 16, bold=True)
+        ep_text = font.render(f"Episode: {episode_num}", True, (0, 0, 0))
+        ep_rect = ep_text.get_rect(topright=(90, 25))
+        self.screen.blit(ep_text, ep_rect)
 
 
-    def render(self, screen="help"):
+    def render(self, episode_num, step_id, screen="help"):
         if self.screen is None:
             pygame.init()
             pygame.display.init()
@@ -422,8 +442,10 @@ class JamSpreadingEnv(gym.Env):
         # draw side panel rectangle (bottom-left)
         side_panel_rect = pygame.Rect(700, 0, 200, 700)
         pygame.draw.rect(self.screen, (247, 243, 238), side_panel_rect)
-
-        self.draw_intervene_button()
+        if(screen != "ready"):
+            self.draw_intervene_button()
+        else:
+            self.draw_intervene_ready_text()
 
         # draw bread image
         bread_img = pygame.image.load("img_c/bread.png").convert_alpha()
@@ -436,10 +458,6 @@ class JamSpreadingEnv(gym.Env):
         box_color = (255, 191, 64)   # Orange-yellow
         box_size = 80
         start_pos = (50, 50)               # x, y for top-left corner
-        # pygame.draw.rect(self.screen, box_color, (*start_pos, box_size, box_size), width=7)
-        
-       
-        # self.draw_box_dividers()
 
         # draw jam
         self.draw_jam()
@@ -447,9 +465,8 @@ class JamSpreadingEnv(gym.Env):
         # save image here
         current_time = time.time()
         if current_time - self.last_save_time >= self.save_interval:
-            filename = f"jam_state_img/test_jam_pic{self.save_counter}.png"
+            filename = f"jam_state_img/test/episode{episode_num}_step{step_id}.png"
             pygame.image.save(self.screen.subsurface((0, 0, 700, 700)), filename)
-            # print(f"Saved image: {filename}")
             self.save_counter += 1
             self.last_save_time = current_time
 
@@ -466,8 +483,6 @@ class JamSpreadingEnv(gym.Env):
         # draw robot
         self.draw_robot()
 
-        # self.draw_coverage_text()
-
         bread_x, bread_y = int(self.state[4]), int(self.state[5])
         pygame.draw.circle(self.screen, (255, 165, 0), (bread_x, bread_y), 25)
 
@@ -475,9 +490,10 @@ class JamSpreadingEnv(gym.Env):
         pygame.draw.circle(self.screen, (255, 165, 0), (610, 140), 25) 
 
         # Draw current screen state text
-        font = pygame.font.SysFont("Arial", 24, bold=True)
+        font = pygame.font.SysFont("Arial", 16, bold=True)
         state_text = font.render(f"Mode: {screen}", True, (0, 0, 0))  # Black text
         self.screen.blit(state_text, (10, 10))  # top-left corner
+        self.draw_episode_num(episode_num)
 
         self.clock.tick(FPS)
         pygame.display.flip()
@@ -554,8 +570,8 @@ if __name__ == "__main__":
             if screen_state == "robot":
                 robot_prediction = next_action
                 need_help = False
-                # if time.time() - last_help_check_time >= 3.0:
-                #     need_help = random.random() < 0.5
+                if time.time() - last_help_check_time >= 2.0:
+                    need_help = random.random() < 0.3
 
                 if env.check_intervene_click():
                     screen_state = "ready"
@@ -564,10 +580,10 @@ if __name__ == "__main__":
                     screen_state = "ready"
                     context = "robot_asked"
                 else:
-                    # obs, _, done, _, _ = env.step(next_action)
                     action = next_action
                     context = "robot_independent"
-
+                    
+                    # takes the next action from the sample_actions list
                     next_action_idx += 1
                     if next_action_idx < len(jam_sample_actions):
                         next_action = jam_sample_actions[next_action_idx]
@@ -578,14 +594,13 @@ if __name__ == "__main__":
                     screen_state = "help"
                     help_start_time = time.time()
                 else:
-                    env.render(screen_state)
+                    env.render(episode_num, step_id, screen_state)
                     time.sleep(1 / 10)
                     continue
 
             elif screen_state == "help":
                 # let human intervene
                 action = env.get_help()
-                # obs, _, done, _, _ = env.step(action)
 
                 # check if help time has expired (3 seconds)
                 if help_start_time and time.time() - help_start_time >= 3.0:
@@ -606,19 +621,25 @@ if __name__ == "__main__":
                     next_action = jam_sample_actions[next_action_idx]
                     last_help_check_time = time.time()
                     screen_state = "robot"
-
             if action is not None:
                 obs, _, done, _, _ = env.step(action)
-                # actions.append(action)
-                # print(robot_prediction)
-                # print(context)
-            env.render(screen_state)
+                img_path = f"jam_state_img/test/episode{episode_num}_step{step_id}.png"
+                timestep = TimeStep(
+                    step_id=step_id,
+                    action=action,
+                    state_v=obs,
+                    state_img_path=img_path,
+                    context=context,
+                    robot_prediction=robot_prediction
+                )
+                episode.add_step(timestep)
+                
+            env.render(episode_num, step_id, screen_state)
+            step_id += 1
             time.sleep(1 / 10)
 
         print(f"Episode {episode_num} ended.")
         controlled_delay(3000)
-        # create_syn_data(actions)
-
     
     env.close()  # Close the Gym environment
     del env  # Explicitly delete the environment
