@@ -526,13 +526,21 @@ class SandwichMakingEnv(gym.Env):
         episode_text = episode_font.render(f"Episode: {self.episode_num}", True, (106, 62, 32))
         self.screen.blit(episode_text, (20, 20))
         
-        if(screen == "help"):
-            help_font = pygame.font.SysFont("calibri", size=16)
-            help_font.set_bold(True)
-            help_text_1 = help_font.render("I need", True, (106, 62, 32))
-            help_text_2 = help_font.render("HELP!", True, (106, 62, 32))
-            self.screen.blit(help_text_1, (1193, 33))
-            self.screen.blit(help_text_2, (1193, 53))
+        if(screen == "help" or screen == "human_intervening"):
+            if screen == "help":
+                help_font = pygame.font.SysFont("calibri", size=16)
+                help_font.set_bold(True)
+                help_text_1 = help_font.render("I need", True, (106, 62, 32))
+                help_text_2 = help_font.render("HELP!", True, (106, 62, 32))
+                self.screen.blit(help_text_1, (1193, 33))
+                self.screen.blit(help_text_2, (1193, 53))
+            else:
+                help_font = pygame.font.SysFont("calibri", size=16)
+                help_font.set_bold(True)
+                help_text_1 = help_font.render("Human", True, (106, 62, 32))
+                help_text_2 = help_font.render("interfering...", True, (106, 62, 32))
+                self.screen.blit(help_text_1, (1193, 33))
+                self.screen.blit(help_text_2, (1183, 53))
 
             # print out valid action options
             options_font = pygame.font.SysFont("calibri", size=16)
@@ -575,6 +583,14 @@ def controlled_delay(delay_time):
     while pygame.time.get_ticks() - start_time < delay_time:
         pygame.event.pump()  # keep event queue active to prevent freezing
 
+def select_action_from_policy(obs, policy_model, dict_actions=None):
+    state_tensor = torch.tensor(np.array(obs)).float().unsqueeze(0)
+    with torch.no_grad():
+        logits = policy_model(state_tensor)
+        action = logits.argmax(dim=1).item()
+    if dict_actions:
+        print("potential valid action:", dict_actions[action])
+    return action
 
 # classes for logging data
 class Step:
@@ -632,19 +648,15 @@ if __name__ == "__main__":
 
             while not done:
                 if need_new_action:
-                    action = env.action_space.sample()
+                    # action = env.action_space.sample()
+                    action = select_action_from_policy(obs, discrete_policy, dict_actions)
+
                     while(env.is_valid_action(action) == False):
                         env.render(screen_state)
                         action = env.action_space.sample()
-                        # state = obs 
-                        # state_tensor = torch.tensor(np.array(state)).float().unsqueeze(0)  # (1, state_dim)
-                        # with torch.no_grad():
-                        #     logits = discrete_policy(state_tensor)
-                        #     action = logits.argmax(dim=1).item()
+                    print("----------")
 
-                            # helper function
-
-                    needs_help = random.random() < 0.3
+                    needs_help = random.random() < 0.1
                     robot_prediction = action; # save robot predicted action
                     step_id += 1
 
@@ -661,11 +673,12 @@ if __name__ == "__main__":
                     interfere_status = env.handle_interfere() 
                     if interfere_status == True:
                         context = "human_intervened"
-                        screen_state = "help"
+                        screen_state = "human_intervening"
+                        # screen_state = "help"
                     else:
                         screen_state = "process_action"
 
-                if screen_state == "help":
+                if (screen_state == "help" or screen_state == "human_intervening"):
                     env.render(screen_state)
                     action = env.get_help()
                     if action != None:
@@ -683,10 +696,6 @@ if __name__ == "__main__":
                         controlled_delay(2000)  # Wait for 2 second between each step
                         
                     need_new_action = True
-            
-            # episode_filename = f"episode_{episode_num + 1}.json"
-            # episode.save_to_json(episode_filename)
-            # print(f"Saved: {episode_filename}")
 
             all_episodes.append(episode)
             print(f"Episode {episode_num} ended.")

@@ -2,6 +2,23 @@ import pickle
 import json
 import random
 import numpy as np
+import pygame
+import os
+
+def render_state(screen, jam_lines, save_path):
+    screen.fill((255, 255, 255))
+
+    bread_img = pygame.image.load("img_c/bread.png").convert_alpha()
+    bread_img = pygame.transform.scale(bread_img, (550, 550)) 
+    bread_pos = ((700 - bread_img.get_width()) // 2,
+                 (700 - bread_img.get_height()) - 30)
+    screen.blit(bread_img, bread_pos)
+
+    if len(jam_lines) > 1:
+        pygame.draw.lines(screen, (255, 0, 0), False, jam_lines, jam_width)  
+
+    pygame.image.save(screen.subsurface((0, 0, 700, 700)), save_path)
+
 
 # Global constants for jam coverage
 jam_width = 40
@@ -115,6 +132,22 @@ if __name__ == "__main__":
         print(f"{i}: {keyword}")
     pref = int(input("Enter preference: "))
     num_episodes = int(input("Enter the number of episodes: "))
+    save_images_input = input("Save images for each step? (y/n): ").strip().lower()
+    save_images = save_images_input == "y"
+
+    if save_images:
+        if os.path.exists("jam_state_img"):
+            for filename in os.listdir("jam_state_img"):
+                file_path = os.path.join("jam_state_img", filename)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+        else:
+            os.makedirs("jam_state_img", exist_ok=True)
+        pygame.init()
+        screen = pygame.display.set_mode((700, 700))
+        pygame.display.set_caption("Jam Render")
+    else:
+        screen = None
     
     all_episodes = []
     if pref == 0:
@@ -153,6 +186,12 @@ if __name__ == "__main__":
                 action[0] += dx
                 action[1] += dy
 
+            if save_images:
+                img_filename = f"jam_state_img/episode{episode_num}_step{step_id}.png"
+                render_state(screen, jam_lines, img_filename)
+            else:
+                img_filename = None
+
             update_state(state, action, jam_lines)
             # state_after = state.copy()
 
@@ -160,7 +199,7 @@ if __name__ == "__main__":
                 step_id=step_id,
                 action=action,
                 state_v=state_before,
-                state_img_path=None,
+                state_img_path=img_filename,
                 context="human_intervened",
                 robot_prediction=None
             )
@@ -175,3 +214,5 @@ if __name__ == "__main__":
         pickle.dump(all_episodes, f)
 
     print("All episodes saved to jam_all_episodes_gen.pkl")
+    if save_images:
+        pygame.quit()

@@ -5,10 +5,14 @@ import pygame
 import pickle
 import time
 import random
-# from jam_sample_action_syn_data.jam_sample_action_zigzag import jam_sample_actions
-import os
+# from jam_sample_actions import jam_sample_actions
 from jam_data_classes import TimeStep, Episode
+import os
 
+# init variables for pygame
+FPS = 30
+VIEWPORT_W = 900
+VIEWPORT_H = 700
 
 # Load the pickled episodes
 with open("jam_all_episodes_gen.pkl", "rb") as f:
@@ -17,11 +21,6 @@ with open("jam_all_episodes_gen.pkl", "rb") as f:
 # Extract episode 0 actions
 ep0 = episodes[0]
 jam_sample_actions = [step.action.tolist() for step in ep0.steps]
-
-# init variables for pygame
-FPS = 30
-VIEWPORT_W = 900
-VIEWPORT_H = 700
 
 class JamSpreadingEnv(gym.Env):
     
@@ -67,7 +66,6 @@ class JamSpreadingEnv(gym.Env):
         self.last_save_time = time.time()
         self.save_counter = 0
 
-        
 
         self.state = np.array([
             90.0, 90.0,      # start_position
@@ -152,7 +150,6 @@ class JamSpreadingEnv(gym.Env):
             0,             # holding_bag (not holding)
             *[0.0] * 8       # jam_coverage
         ], dtype=np.float32)
-        
 
         # reset pygame variables
         self.jam_lines = []
@@ -165,10 +162,6 @@ class JamSpreadingEnv(gym.Env):
     
     def step(self, action):
 
-        # check if the action is valid - needed?
-
-        # update objects
-
         # update the state after the action is performed
         self.update_state(action)
         self.action_log.append(np.array(action, dtype=np.float32))
@@ -180,7 +173,6 @@ class JamSpreadingEnv(gym.Env):
         done = self.is_done()
 
         # pygame screen change
-
         return self.state, 0, done, False, {} 
 
     def update_state(self, action):
@@ -258,12 +250,6 @@ class JamSpreadingEnv(gym.Env):
             if event.type == pygame.MOUSEBUTTONDOWN:
                 dist = ((mouse_x - robot_x) ** 2 + (mouse_y - robot_y) ** 2) ** 0.5
                 return dist <= 30
-                # else:
-                #     # Click near tip of the bag
-                #     tip_x = robot_x + 35
-                #     tip_y = robot_y + 70
-                #     dist = ((mouse_x - tip_x) ** 2 + (mouse_y - tip_y) ** 2) ** 0.5
-                #     return dist <= 30
             elif event.type == pygame.QUIT:
                 pygame.quit()
                 exit()
@@ -344,6 +330,7 @@ class JamSpreadingEnv(gym.Env):
 
         distance = ((tip_x - bread_x) ** 2 + (tip_y - bread_y) ** 2) ** 0.5
         if distance <= 25:
+            print("hit!")
             self.hit_bread_endpoints = True
     
     def draw_robot(self):
@@ -510,20 +497,6 @@ class TimeStep:
         self.state_img = state_img_path
         self.context = context  # "robot_independent", "robot_asked", or "human_intervened"
         self.robot_prediction = robot_prediction
-
-        # time step 0 
-        # state_v
-        # state_img
-        # trajectory (robot)
-        # episode (human)
-
-        # circle 
-        # spiral
-        # x 
-        # zigzag
-
-        # 10
-
     def to_dict(self):
         return self.__dict__
 
@@ -636,7 +609,6 @@ if __name__ == "__main__":
 
             if action is not None:
                 obs, _, done, _, _ = env.step(action)
-                print(action)
                 # actions.append(action)
                 # print(robot_prediction)
                 # print(context)

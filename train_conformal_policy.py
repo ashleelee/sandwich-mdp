@@ -53,12 +53,12 @@ discrete_policy = Discrete_Policy(state_dim=x_train.shape[1], output_dim=N_actio
 
 
 # define the optimizer
-optimizer = optim.Adam(discrete_policy.parameters(), lr=0.001)
+optimizer = optim.Adam(discrete_policy.parameters(), lr=0.0005)
 # loss_fn
 loss_fn = torch.nn.CrossEntropyLoss()
 
 # training loop
-N_eps = 100
+N_eps = 150
 train_losses = []
 for epoch in range(N_eps):
     total_loss = 0
