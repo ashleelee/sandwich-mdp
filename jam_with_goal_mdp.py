@@ -1,636 +1,840 @@
+import os
+import time
+import random
+import pickle
+from typing import Optional, Tuple, List
+
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pygame
-import pickle
-import time
-import random
-import os
 import torch
 
 from jam_data_classes import TimeStep, Episode
 from policies.conformal.mlp import Continuous_Policy
 
-# -----------------------------
-# Layout / UI config
-# -----------------------------
+# =========================
+# Global constants & config
+# =========================
+
 FPS = 30
+VIEWPORT_W = 1000
+VIEWPORT_H = 800
 
-# Canvas (left) + side panel (right)
-CANVAS_W = 840          # wider canvas so the top strip is wider than the bread
-PANEL_W  = 260
-VIEWPORT_W = CANVAS_W + PANEL_W
-VIEWPORT_H = 860        # taller window
+# Control Toggle
+HUMAN_ALWAYS_CONTROL = True
 
-# Top thumbnails strip
-TOP_BAR_H = 130
-THUMB_W, THUMB_H = 96, 68
-THUMB_SPACING = 12
-THUMB_MARGIN_X = 14
+# Side panel geometry
+SIDE_PANEL_X = 800
+SIDE_PANEL_Y = 150
+SIDE_PANEL_W = 200
+SIDE_PANEL_H = VIEWPORT_H - SIDE_PANEL_Y
 
-# Bread
-BREAD_W, BREAD_H = 450, 450                  # (1) smaller bread
-BREAD_TOP = TOP_BAR_H + 150
-BREAD_X = (CANVAS_W - BREAD_W) // 2          # centered in canvas
+# Top tray bar and bag placement
+TOP_TRAY_H = 150
+TOP_TRAY_RECT = pygame.Rect(0, 0, VIEWPORT_W, TOP_TRAY_H)
 
-# Bag + picking/placing logic
-GRAB_RADIUS = 44      # distance to a bag home to grab
-PLACE_RADIUS = 44     # distance to a bag home to "place" the bag
+# Spread
+SPREAD_TYPES = ["jam", "peanut", "nutella", "avocado"]
+SPREAD_COLOR = {
+    "jam":      (220, 80, 100),
+    "peanut":   (227, 152, 60),
+    "nutella":  (110, 80, 40),
+    "avocado":  (80, 170, 90),
+}
 
-# Spreads: name, selector color, jam color, file suffix
-SPREADS = [
-    ("Jam",            (239,120,120), (255, 60, 60),  ""),
-    ("Peanut Butter",  (245,178,82),  (188,140,77),   "_b"),
-    ("Nutella",        (104,74,44),   (90, 60, 40),   "_c"),
-    ("Avocado",        (152,223,152), (85,160, 85),   "_d"),
-]
+# Where the four bags sit on the top tray 
+BAG_Y = 140
+BAG_ANCHORS = {
+    "jam":      (420,  BAG_Y),
+    "peanut":   (520,  BAG_Y),
+    "nutella":  (620,  BAG_Y),
+    "avocado":  (720,  BAG_Y),
+}
 
-# Bag anchors under/near the top selector row (x is spread across the canvas)
-BAG_ANCHORS = [
-    (CANVAS_W//2 - 210, TOP_BAR_H - 50),
-    (CANVAS_W//2 - 70,  TOP_BAR_H - 50),
-    (CANVAS_W//2 + 70,  TOP_BAR_H - 50),
-    (CANVAS_W//2 + 210, TOP_BAR_H - 50),
-]
+PICKUP_RADIUS = 40  
 
-# spread selector row layout
-SPREAD_ROW_Y = TOP_BAR_H + 70   # move this larger to push the row further down
-SELECTOR_W = 78
-SELECTOR_H = 78
-BAG_ICON_SIZE = 100           # bag icon inside the selector box
+# ===== Sidebar info widgets =====
+INFO_BOX_OUTLINE = (238, 197, 144)
+INFO_BOX_FILL    = (255, 244, 226)
+INFO_TEXT_COLOR  = (102, 73, 45)
 
-# -----------------------------
-# Load demo episode
-# -----------------------------
-with open("jam_all_episodes_gen.pkl", "rb") as f:
-    episodes_pickle = pickle.load(f)
-ep0 = episodes_pickle[0]
-jam_sample_actions = [step.action.tolist() for step in ep0.steps]
+# =========================
+# state layout (12-D)
+# [ rx, ry, g, holding, coverage[8] ]
+# =========================
+IDX_RX = 0           # robot x
+IDX_RY = 1           # robot y
+IDX_G  = 2           # gripper (0.0 open, 0.5 hold, 1.0 clutch)
+IDX_H  = 3           # holding flag (0.0/1.0)
+IDX_C0 = 4           # coverage[0] starts here (8 cells total)
+STATE_DIM = 12
 
-# -----------------------------
-# Env
-# -----------------------------
+# ======================
+# Helper / utility funcs
+# ======================
+
+def controlled_delay(delay_ms: int) -> None:
+    """Non-blocking delay while keeping pygame responsive."""
+    start_time = pygame.time.get_ticks()
+    while pygame.time.get_ticks() - start_time < delay_ms:
+        pygame.event.pump()
+
+
+def get_prediction(
+    obs: np.ndarray,
+    obs_prev1: np.ndarray,
+    obs_prev2: np.ndarray,
+    policy_model: Continuous_Policy,
+) -> np.ndarray:
+    """
+    Placeholder to keep compatibility with the old call sites.
+    Your policy normalizer for 12-D is deferred for now.
+    """
+    raise NotImplementedError("Robot policy not wired for 12-D state yet. Set HUMAN_ALWAYS_CONTROL = True.")
+
+
+# ==========================
+# Environment implementation
+# ==========================
+
 class JamSpreadingEnv(gym.Env):
+    """
+    Pygame-based environment for jam spreading.
+    Action: [x, y, gripper] (continuous)
+    Observation (12-D): [rx, ry, g, holding, coverage[8]]
+    """
+    JAM_WIDTH = 40
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
-        # Pygame display MUST be ready before convert_alpha
-        pygame.init()
-        pygame.display.init()
+        # Pygame init
+        if not pygame.get_init():
+            pygame.init()
+            pygame.display.init()
         self.screen: pygame.Surface = pygame.display.set_mode((VIEWPORT_W, VIEWPORT_H))
-        self.clock = pygame.time.Clock()
+        self.clock: pygame.time.Clock = pygame.time.Clock()
 
-        # State & UI
-        self.jam_lines = []
-        self.jam_width = 36  # slightly slimmer lines to fit the smaller bread
-        self.action_log = []
-        self.round_thumbnails = []  # past breads
-        self.current_spread_idx = 0  # UI selection highlight
-        self.held_spread_idx = -1    # which bag the robot is actually holding (-1 = none)
-
-        # Timing for saving images
-        self.save_interval = 0.0
+        # Drawing & state holders
+        self.save_interval = 5.0
         self.last_save_time = time.time()
         self.save_counter = 0
-        self._init_selectors()
 
-        # Build sub-systems
-        self._init_state()
-        self._init_spaces()
-        self._load_images()
-        self._init_layout_and_boxes()  # boxes depend on bread rect
-        # self._init_selectors()
+        # Legacy / per-spread lines
+        self.jam_lines: List[Tuple[int, int]] = []
+        self.spread_lines = {name: [] for name in SPREAD_TYPES}  # per-spread jam traces
+        self.active_spread = "jam"                                # which bag user is interacting with
+        self.held_spread = None                                   # None or one of SPREAD_TYPES
+        self.bag_current_pos = dict(BAG_ANCHORS)                  # each bag's current location (follows robot when held)
 
-        self.done = False
-        self.hit_bread_endpoints = False
-        self.last_gripper_state = 0.5
-
-    # ---------- state and spaces ----------
-    def _init_state(self):
-        # dynamic endpoints: one point near bottom of bread (for "touch bread" goal)
-        bread_end_x = BREAD_X + BREAD_W//2
-        bread_end_y = BREAD_TOP + BREAD_H - 32
-
-        # initial robot and a "generic" bag home (not actually used for logic now)
+        # 12-D state
         self.state = np.array([
-            90.0, 90.0,
-            self.bag_home_positions[0][0], self.bag_home_positions[0][1],  # legacy fields
-            bread_end_x, bread_end_y,
-            90.0, 90.0,
-            0.0, 0.0,
-            *([0.0] * 8)
+            90.0, 90.0,   # rx, ry
+            0.0,          # gripper (open)
+            0.0,          # holding flag
+            *([0.0] * 8)  # coverage for 8 boxes
         ], dtype=np.float32)
 
-
-    def _init_spaces(self):
+        # Spaces
         self.action_space = spaces.Box(
             low=np.array([0.0, 0.0, 0.0], dtype=np.float32),
-            high=np.array([CANVAS_W, VIEWPORT_H, 1.0], dtype=np.float32),
+            high=np.array([VIEWPORT_W, VIEWPORT_H, 1.0], dtype=np.float32),
             dtype=np.float32
         )
         self.observation_space = spaces.Box(
-            low=np.array([0.0] * 18, dtype=np.float32),
-            high=np.array([
-                CANVAS_W, VIEWPORT_H,   # start
-                CANVAS_W, VIEWPORT_H,   # bag pos (legacy; unused)
-                CANVAS_W, VIEWPORT_H,   # bread endpoint
-                CANVAS_W, VIEWPORT_H,   # robot pos
-                1.0,                    # gripper
-                1.0,                    # holding
-                *([1.0] * 8)
-            ], dtype=np.float32),
+            low=np.array([0.0, 0.0, 0.0, 0.0] + [0.0] * 8, dtype=np.float32),
+            high=np.array([VIEWPORT_W, VIEWPORT_H, 1.0, 1.0] + [1.0] * 8, dtype=np.float32),
             dtype=np.float32
         )
 
-    def _load_images(self):
-        # Robot hands
+        # Goal
+        self.goal = [1, 0, 0, 0]
+
+        # Flags
+        self.done = False
+        self.last_gripper_state = 0.5
+
+        # Assets
+        self._load_images()
+
+        # Bread grid geometry (for coverage)
+        bread_w, bread_h = self.bread_img.get_size()
+        bread_pos = ((700 - self.bread_img.get_width()) // 2,
+             (VIEWPORT_H - self.bread_img.get_height()) - 30)
+        bx0, by0 = bread_pos
+
+        rows, cols = 4, 2
+        cell_w = (bread_w-50) // cols   # ~250
+        cell_h = bread_h // rows   # ~125
+
+        self.box_size = (cell_w, cell_h)
+        self.box_positions = []
+
+        for r in range(rows):
+            for c in range(cols):
+                x = 25 + bx0 + c * cell_w
+                y = by0 + r * cell_h
+                self.box_positions.append((x, y))
+
+        self.box_area = self.box_size[0] * self.box_size[1]
+
+        
+
+        # Click space to proceed to next episode
+        self.manual_end = False
+
+    # ---------- assets ----------
+
+    def _load_images(self) -> None:
+        def _load(path: str, size: Optional[Tuple[int, int]] = None) -> pygame.Surface:
+            surf = pygame.image.load(path).convert_alpha()
+            return pygame.transform.scale(surf, size) if size else surf
+
         self.robot_images = {
-            "open":   pygame.transform.scale(pygame.image.load("img_c/open.png").convert_alpha(),   (175, 175)),
-            "hold":   pygame.transform.scale(pygame.image.load("img_c/hold.png").convert_alpha(),   (175, 175)),
-            "clutch": pygame.transform.scale(pygame.image.load("img_c/clutch.png").convert_alpha(), (175, 175)),
+            "open":   _load("img_c/open.png", (175, 175)),
+            "hold":   _load("img_c/hold.png", (175, 175)),
+            "clutch": _load("img_c/clutch.png", (175, 175)),
         }
 
-        # Bags per spread
-        self.piping_bag_images = []
-        for _name, _ui, _jam, suf in SPREADS:
-            nf = f"img_c/normal{suf}.png" if suf else "img_c/normal.png"
-            sf = f"img_c/squeezed{suf}.png" if suf else "img_c/squeezed.png"
-            self.piping_bag_images.append({
-                "normal":   pygame.transform.scale(pygame.image.load(nf).convert_alpha(), (175, 175)),
-                "squeezed": pygame.transform.scale(pygame.image.load(sf).convert_alpha(), (175, 175)),
-            })
+        # Per-spread bag art
+        self.piping_bag_images = {
+            "jam": {
+                "normal":   _load("img_c/normal.png",   (175, 175)),
+                "squeezed": _load("img_c/squeezed.png", (175, 175)),
+            },
+            "peanut": {
+                "normal":   _load("img_c/normal_b.png",   (175, 175)),
+                "squeezed": _load("img_c/squeezed_b.png", (175, 175)),
+            },
+            "nutella": {
+                "normal":   _load("img_c/normal_c.png",   (175, 175)),
+                "squeezed": _load("img_c/squeezed_c.png", (175, 175)),
+            },
+            "avocado": {
+                "normal":   _load("img_c/normal_d.png",   (175, 175)),
+                "squeezed": _load("img_c/squeezed_d.png", (175, 175)),
+            },
+        }
 
-        # Bread + bowl
-        self.bread_img = pygame.transform.scale(pygame.image.load("img_c/bread.png").convert_alpha(), (BREAD_W, BREAD_H))
-        self.bowl_img  = pygame.transform.scale(pygame.image.load("img_c/bowl.png").convert_alpha(),  (100, 100))
+        self.bread_img = _load("img_c/bread.png", (500, 500))
+        self.bowl_img  = _load("img_c/bowl.png",  (100, 100))
 
-    def _init_layout_and_boxes(self):
-        # bread rect and dynamic 2x4 grid inside it
-        self.bread_rect = pygame.Rect(BREAD_X, BREAD_TOP, BREAD_W, BREAD_H)
+    # ---------- gym API ----------
 
-        # 2 columns, 4 rows with small gutters
-        gutter = 10
-        box_w = (BREAD_W // 2) - gutter
-        box_h = (BREAD_H // 4) - gutter
-
-        self.box_size = (box_w, box_h)
-        self.box_positions = []
-        for r in range(4):
-            for c in range(2):
-                x = BREAD_X + c * (box_w + gutter) + (gutter // 2)
-                y = BREAD_TOP + r * (box_h + gutter) + (gutter // 2)
-                self.box_positions.append((x, y))
-        self.box_area = box_w * box_h
-
-    def _init_selectors(self):
-        # centers spaced across the canvas width
-        centers_x = [
-            CANVAS_W//2 - 210,
-            CANVAS_W//2 - 70,
-            CANVAS_W//2 + 70,
-            CANVAS_W//2 + 210,
-        ]
-        self.selector_rects = []
-        for cx in centers_x:
-            rect = pygame.Rect(0, 0, SELECTOR_W, SELECTOR_H)
-            rect.center = (cx, SPREAD_ROW_Y)
-            self.selector_rects.append(rect)
-
-        # use selector centers as the true "bag home" positions for grab/place logic
-        self.bag_home_positions = [r.center for r in self.selector_rects]
-
-
-    # ---------- gym api ----------
-    def reset(self, seed=None, options=None):
+    def reset(self, seed: Optional[int] = None, options=None) -> Tuple[np.ndarray, dict]:
         super().reset(seed=seed)
+        self.state[:] = np.array([
+            90.0, 90.0,   # rx, ry
+            0.0,          # gripper open
+            0.0,          # holding flag
+            *([0.0] * 8)  # coverage
+        ], dtype=np.float32)
+
         self.jam_lines.clear()
+        self.spread_lines = {name: [] for name in SPREAD_TYPES}
+        self.active_spread = "jam"
+        self._update_goal()
+        self.held_spread = None
+        self.bag_current_pos = dict(BAG_ANCHORS)
+
         self.done = False
-        self.hit_bread_endpoints = False
         self.last_gripper_state = 0.5
-        self.held_spread_idx = -1
-        self._init_state()                   # refresh endpoints
         return self.state, {}
 
-    def step(self, action):
-        self._update_state_with_action(action)
-        self._maybe_grab_or_place_bag()
-        self._check_hit_bread_endpoints()
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
+        self._update_state(action)
         done = self._is_done()
         return self.state, 0.0, done, False, {}
 
-    # ---------- interaction logic ----------
-    def _update_state_with_action(self, action):
-        self.state[6] = action[0]
-        self.state[7] = action[1]
-        self.state[8] = action[2]
+    # ---------- internals ----------
 
-        # leave legacy bag fields untouched (we render bag homes from BAG_ANCHORS)
+    def _update_state(self, action: np.ndarray) -> None:
+        # Desired new robot pose/gripper from action
+        desired_x, desired_y, desired_g = float(action[0]), float(action[1]), float(action[2])
 
-        # draw jam when clutching with a held bag
-        if self.state[8] == 1.0 and self.state[9] == 1.0 and not self.hit_bread_endpoints:
-            jam_point = (int(self.state[6] + 35), int(self.state[7] + 70))
-            if (not self.jam_lines) or jam_point != self.jam_lines[-1]:
-                self.jam_lines.append(jam_point)
-                self._update_jam_coverage_area()
+        # Enforce: outside tray, cannot set open (0.0). Force to hold (0.5).
+        if not self._over_tray(desired_x, desired_y) and self.state[IDX_H] and desired_g == 0.0:
+            desired_g = 0.5
 
-    def _maybe_grab_or_place_bag(self):
-        """ (2) & (4) Grab closest bag when holding; place bag at its home to finish. """
-        rx, ry = self.state[6], self.state[7]
-        g = self.state[8]     # 0 open, 0.5 hold, 1 clutch
+        # Apply to state
+        self.state[IDX_RX], self.state[IDX_RY], self.state[IDX_G] = desired_x, desired_y, desired_g
+        robot_x, robot_y = self.state[IDX_RX], self.state[IDX_RY]
+        gripper_state = self.state[IDX_G]
 
-        # GRAB
-        if g == 0.5 and self.state[9] == 0.0:
-            closest_i, closest_d = -1, 1e9
-            for i, (hx, hy) in enumerate(self.bag_home_positions):
-                d = ((rx - hx)**2 + (ry - hy)**2)**0.5
-                if d < closest_d:
-                    closest_i, closest_d = i, d
-            if closest_d <= GRAB_RADIUS:
-                self.state[9] = 1.0
-                self.held_spread_idx = closest_i
-                self.current_spread_idx = closest_i
+        # If not holding anything yet, allow pickup by proximity:
+        if self.held_spread is None and gripper_state == 0.5:
+            tip_x, tip_y = robot_x, robot_y
+            for name in SPREAD_TYPES:
+                if self._is_on_tray(name):
+                    ax, ay = BAG_ANCHORS[name]
+                    dist = np.hypot(tip_x - ax, tip_y - ay)
+                else:
+                    bx, by = self.bag_current_pos[name]
+                    dist = np.hypot(tip_x - bx, tip_y - by)
 
-        # PLACE
-        if g == 0.0 and self.state[9] == 1.0 and self.held_spread_idx != -1:
-            hx, hy = self.bag_home_positions[self.held_spread_idx]
-            d = ((rx - hx)**2 + (ry - hy)**2)**0.5
-            if d <= PLACE_RADIUS:
-                self.state[9] = 0.0
-                if self.hit_bread_endpoints:
-                    self.done = True
+                if dist <= PICKUP_RADIUS:
+                    self.held_spread = name
+                    self.active_spread = name
+                    self.state[IDX_H] = 1.0
+                    self._update_goal()
+                    break
+
+        # If holding a bag, make its position follow the robot and (optionally) deposit jam
+        if self.held_spread is not None:
+            # bag follows robot hand
+            self.bag_current_pos[self.held_spread] = (robot_x, robot_y)
+
+            if self.state[IDX_G] == 1.0:  # clutching
+                jam_point = (int(robot_x + 35), int(robot_y + 70))
+                # legacy combined trace
+                if (not self.jam_lines) or (jam_point != self.jam_lines[-1]):
+                    self.jam_lines.append(jam_point)
+                    self._update_jam_coverage_area()
+                # per-spread trace
+                lines = self.spread_lines[self.held_spread]
+                if (not lines) or (jam_point != lines[-1]):
+                    lines.append(jam_point)
+
+        # --- Release logic: only drop if the TIP is inside this bag's dock square ---
+        if self.held_spread is not None and gripper_state == 0.0:
+            name = self.held_spread
+            tip_x = float(robot_x + 35)
+            tip_y = float(robot_y + 70)
+
+            if self._bag_dock_rect(name).collidepoint(int(tip_x), int(tip_y)):
+                # Allowed: snap back to that bag's tray anchor
+                ax, ay = BAG_ANCHORS[name]
+                self.bag_current_pos[name] = (ax, ay)
+                self.state[IDX_H] = 0.0
+                self.held_spread = None
+            else:
+                # Not allowed: keep holding
+                self.state[IDX_G] = 0.5
+                self.state[IDX_H] = 1.0
+    
+    def _update_goal(self) -> None:
+        """Update the one-hot goal vector based on current active_spread."""
+        self.goal = [1 if name == self.active_spread else 0 for name in SPREAD_TYPES]
 
 
-    def _update_jam_coverage_area(self):
+    def _update_jam_coverage_area(self) -> None:
         if len(self.jam_lines) < 2:
             return
+        w = self.JAM_WIDTH
         box_areas_covered = [0.0] * 8
-        w = self.jam_width
-
-        for i in range(len(self.jam_lines) - 1):
-            x1, y1 = self.jam_lines[i]
-            x2, y2 = self.jam_lines[i + 1]
+        for (x1, y1), (x2, y2) in zip(self.jam_lines[:-1], self.jam_lines[1:]):
             dx, dy = abs(x2 - x1), abs(y2 - y1)
             seg_area = max(dx, dy) * w
-
             min_x = min(x1, x2) - w // 2
             min_y = min(y1, y2) - w // 2
             max_x = max(x1, x2) + w // 2
             max_y = max(y1, y2) + w // 2
             seg_rect = pygame.Rect(min_x, min_y, max_x - min_x, max_y - min_y)
-
             for j, (bx, by) in enumerate(self.box_positions):
                 box_rect = pygame.Rect(bx, by, *self.box_size)
                 inter = seg_rect.clip(box_rect)
                 if inter.width > 0 and inter.height > 0:
                     overlap_area = inter.width * inter.height
-                    box_areas_covered[j] += (overlap_area / (seg_rect.width * seg_rect.height)) * seg_area
-
+                    # approximate fractional overlap allocation
+                    denom = max(seg_rect.width * seg_rect.height, 1)
+                    box_areas_covered[j] += (overlap_area / denom) * seg_area
         for i in range(8):
-            self.state[10 + i] = min(box_areas_covered[i] / self.box_area, 1.0)
+            self.state[IDX_C0 + i] = min(box_areas_covered[i] / self.box_area, 1.0)
 
-    def _is_done(self):
-        # Done is now controlled by placing the bag back home *after* touching bread endpoint.
+    def _is_done(self) -> bool:
+        if self.manual_end:
+            self.done = True
+            print("done (manual)")
+            return True
+
+        g_open = (self.state[IDX_G] == 0.0)
+        not_holding = (self.state[IDX_H] == 0.0)
+        coverage = self.state[IDX_C0:IDX_C0+8]
+        done = g_open and not_holding and (np.mean(coverage) >= 0.9)
+        self.done = bool(done)
+        if self.done:
+            print("done")
         return self.done
 
-    def _check_hit_bread_endpoints(self):
-        rx, ry = self.state[6], self.state[7]
-        bread_x, bread_y = self.state[4], self.state[5]  # dynamic endpoint near bottom center of bread
-        tip_x, tip_y = rx + 35, ry + 70
-        if ((tip_x - bread_x)**2 + (tip_y - bread_y)**2)**0.5 <= 28:
-            self.hit_bread_endpoints = True
 
-    # ---------- input helpers ----------
-    def _cycle_gripper_on_click(self, current):
-        if current == 0.0:   return 0.5
-        if current == 0.5:   return 1.0 if self.last_gripper_state != 1.0 else 0.0
-        return 0.5
+    # inside JamSpreadingEnv
+    def _bag_dock_rect(self, name: str) -> pygame.Rect:
+        ax, ay = BAG_ANCHORS[name]
+        # same numbers as _draw_trays so logic == visuals
+        return pygame.Rect(int(ax) - 35, int(ay) + 25, 70, 70)
 
-    def ready_to_help(self):
-        # unchanged (click near robot dot)
+    # ---------- human input helpers ----------
+
+    def ready_to_help(self) -> bool:
         mouse_x, mouse_y = pygame.mouse.get_pos()
-        rx, ry = self.state[6], self.state[7]
+        rx, ry = self.state[IDX_RX], self.state[IDX_RY]
         for event in pygame.event.get():
             if event.type == pygame.MOUSEBUTTONDOWN:
-                dist = ((mouse_x - rx)**2 + (mouse_y - ry)**2)**0.5
-                return dist <= 30
-            elif event.type == pygame.QUIT:
-                pygame.quit(); exit()
+                return np.hypot(mouse_x - rx, mouse_y - ry) <= 30.0
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                raise SystemExit
         return False
 
-    def check_intervene_click(self):
-        # right-panel Intervene button + spread selector clicks
+    def check_intervene_click(self) -> bool:
         for event in pygame.event.get():
             if event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = event.pos
-                button_rect = pygame.Rect(CANVAS_W + (PANEL_W - 140)//2, (VIEWPORT_H - 40)//2, 140, 44)
-                if button_rect.collidepoint(mx, my):
-                    return True
-                # selectors
-                for i, r in enumerate(self.selector_rects):
-                    if r.collidepoint(mx, my):
-                        self.current_spread_idx = i
-                        return False
-            elif event.type == pygame.QUIT:
-                pygame.quit(); exit()
+                button_w, button_h = 120, 40
+                bx = SIDE_PANEL_X + (SIDE_PANEL_W - button_w) // 2
+                by = SIDE_PANEL_Y + (SIDE_PANEL_H - button_h) // 2
+                return pygame.Rect(bx, by, button_w, button_h).collidepoint(mx, my)
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                raise SystemExit
         return False
 
-    def get_help(self):
+    def _over_tray(self, x: float, y: float) -> bool:
+        ix, iy = int(x) + 35, int(y) + 70
+        for name in SPREAD_TYPES:
+            if self._bag_dock_rect(name).collidepoint(ix, iy):
+                return True
+            
+        return False
+
+    def get_help(self) -> np.ndarray:
+        # Cursor-controlled robot position
         x, y = pygame.mouse.get_pos()
-        gr = self.state[8]
+        current = float(self.state[IDX_G])
+        gripper = current
+
+        over_tray = self._over_tray(self.state[IDX_RX], self.state[IDX_RY])
+
         for event in pygame.event.get():
             if event.type == pygame.MOUSEBUTTONDOWN:
-                newg = self._cycle_gripper_on_click(gr)
-                self.last_gripper_state = gr
-                gr = newg
+                if over_tray:
+                    # Full cycle 0.0 -> 0.5 -> 1.0 -> 0.0
+                    cycle = [0.0, 0.5]
+                    try:
+                        i = cycle.index(round(current, 1))
+                    except ValueError:
+                        i = 0
+                    gripper = cycle[(i + 1) % len(cycle)]
+                else:
+                    # Outside the tray: only toggle between hold (0.5) and clutch (1.0).
+                    if current <= 0.5:
+                        gripper = 0.5 if current == 0.0 else 1.0
+                    else:
+                        gripper = 0.5
+                self.last_gripper_state = current
+
             elif event.type == pygame.QUIT:
-                pygame.quit(); exit()
-        return np.array([x, y, gr], dtype=np.float32)
+                pygame.quit()
+                raise SystemExit
 
-    # ---------- drawing ----------
-    def _draw_robot(self):
-        g = self.state[8]
-        img = self.robot_images["open"] if g == 0.0 else (self.robot_images["hold"] if g == 0.5 else self.robot_images["clutch"])
-        rect = img.get_rect(center=(int(self.state[6]), int(self.state[7])))
-        self.screen.blit(img, rect)
+        return np.array([x, y, gripper], dtype=np.float32)
 
-    def _draw_bags(self):
-        """Draw the 4 bags at their homes; if holding one, draw that bag at the robot."""
-        # draw home bags
-        for i, (cx, cy) in enumerate(BAG_ANCHORS):
-            bag_imgs = self.piping_bag_images[i]
-            bag = bag_imgs["normal"]
-            small = pygame.transform.scale(bag, (110, 110))
-            self.screen.blit(small, small.get_rect(center=(cx, cy)))
-        # draw held bag on robot (overwrites home visual)
-        if self.state[9] == 1.0 and self.held_spread_idx != -1:
-            bag_imgs = self.piping_bag_images[self.held_spread_idx]
-            bag = bag_imgs["squeezed"] if self.state[8] == 1.0 else bag_imgs["normal"]
-            pos = (int(self.state[6]), int(self.state[7]))
-            self.screen.blit(bag, bag.get_rect(center=pos))
+    def _is_on_tray(self, name: str) -> bool:
+        bx, by = self.bag_current_pos[name]
+        ax, ay = BAG_ANCHORS[name]
+        return np.hypot(bx - ax, by - ay) <= PICKUP_RADIUS
 
-    def _draw_jam(self):
-        if len(self.jam_lines) > 1 and self.held_spread_idx != -1:
-            jam_color = SPREADS[self.held_spread_idx][2]
-            pygame.draw.lines(self.screen, jam_color, False, self.jam_lines, self.jam_width)
-
-    def _draw_top_thumbnails(self):
-        if not self.round_thumbnails:
+    def save_completed_toast(self, episode_num: int) -> str:
+        """
+        Save the current toast into jam_state_img/completed/
+        with filename = {episode_num}.png
+        """
+        os.makedirs("jam_state_img/completed", exist_ok=True)
+        filename = f"jam_state_img/completed/{episode_num}.png"
+        subsurf = self.screen.subsurface((75, TOP_TRAY_H+100, 550, VIEWPORT_H - TOP_TRAY_H-100))
+        pygame.image.save(subsurf, filename)
+        print(f"Saved completed toast -> {filename}")
+        return filename
+    
+    def _load_completed_thumbs(self) -> None:
+        """Load all completed toasts as 75×75 thumbnails with 30px spacing."""
+        self.completed_thumbs: list[pygame.Surface] = []
+        folder = "jam_state_img/completed"
+        if not os.path.exists(folder):
             return
-        x = THUMB_MARGIN_X
-        y = (TOP_BAR_H - THUMB_H)//2
-        for img in self.round_thumbnails[-12:]:
-            self.screen.blit(img, (x, y))
-            pygame.draw.rect(self.screen, (176,148,120), pygame.Rect(x, y, THUMB_W, THUMB_H), 2, border_radius=8)
-            x += THUMB_W + THUMB_SPACING
+        for fname in sorted(os.listdir(folder)):
+            if fname.endswith(".png"):
+                img = pygame.image.load(os.path.join(folder, fname)).convert_alpha()
+                thumb = pygame.transform.scale(img, (100, 100))
+                self.completed_thumbs.append(thumb)
+    # ---------- drawing ----------
 
-    def _draw_spread_selectors(self):
-        font = pygame.font.SysFont("Arial", 16)
-        for i, ((name, box_color, _jam, _suf), rect) in enumerate(zip(SPREADS, self.selector_rects)):
-            # outer colored box
-            pygame.draw.rect(self.screen, box_color, rect, width=6, border_radius=10)
-            if i == self.current_spread_idx:
-                pygame.draw.rect(self.screen, (0,0,0), rect, width=3, border_radius=10)
+    def draw_intervene_button(self) -> None:
+        button_w, button_h = 120, 40
+        bx = SIDE_PANEL_X + (SIDE_PANEL_W - button_w) // 2
+        by = SIDE_PANEL_Y + (SIDE_PANEL_H - button_h) // 2
+        rect = pygame.Rect(bx, by, button_w, button_h)
+        pygame.draw.rect(self.screen, (255, 224, 161), rect)
+        font = pygame.font.SysFont("Arial", 20, bold=True)
+        text = font.render("Intervene", True, (203, 91, 59))
+        self.screen.blit(text, text.get_rect(center=rect.center))
 
-            # bag icon centered INSIDE the box
-            bag = self.piping_bag_images[i]["normal"]
-            bag_small = pygame.transform.smoothscale(bag, (BAG_ICON_SIZE, BAG_ICON_SIZE))
-            self.screen.blit(bag_small, bag_small.get_rect(center=rect.center))
+    def _draw_info_row(self, x, y, label, value, font_label, font_value):
+        label_surf = font_label.render(label, True, INFO_TEXT_COLOR)
+        self.screen.blit(label_surf, (x, y))
 
-            # label under the box
-            label = font.render(name, True, (0,0,0))
-            self.screen.blit(label, (rect.centerx - label.get_width()//2, rect.bottom + 6))
+        val_surf = font_value.render(str(value), True, INFO_TEXT_COLOR)
+        pad_x, pad_y = 12, 6
+        val_rect = val_surf.get_rect()
+        val_rect.topleft = (x + 90, y - 2)
+        bg_rect = pygame.Rect(val_rect.x - pad_x, val_rect.y - pad_y,
+                            val_rect.w + 2*pad_x, val_rect.h + 2*pad_y)
+        pygame.draw.rect(self.screen, INFO_BOX_FILL, bg_rect, border_radius=6)
+        pygame.draw.rect(self.screen, INFO_BOX_OUTLINE, bg_rect, width=2, border_radius=6)
+        self.screen.blit(val_surf, val_rect)
+
+    def _draw_sidebar_info(self, episode_num: int, spread_name: str, mode_name: str):
+        """Draw Toast Count / Spread / Mode blocks in the right sidebar."""
+        font_label = pygame.font.SysFont("Arial", 18, bold=True)
+        font_value = pygame.font.SysFont("Arial", 18)
+
+        left_x = SIDE_PANEL_X + 20
+        base_y = SIDE_PANEL_Y + 20
+
+        self._draw_info_row(left_x, base_y +   0, "Count:", episode_num, font_label, font_value)
+        self._draw_info_row(left_x, base_y +  66, "Spread:", spread_name, font_label, font_value)
+        self._draw_info_row(left_x, base_y + 132, "Mode:", mode_name, font_label, font_value)
 
 
-    def draw_episode_num(self, episode_num):
+    def draw_intervene_ready_text(self) -> None:
+        font = pygame.font.SysFont("Arial", 14, bold=True)
+        color = (139, 69, 19)
+        lines = ["Please click on the dot on", "the robot arm and guide", "me with your cursor."]
+        x = SIDE_PANEL_X + 15
+        y0 = 300
+        for i, line in enumerate(lines):
+            surf = font.render(line, True, color)
+            self.screen.blit(surf, (x, y0 + i * 24))
+
+    def _draw_robot(self) -> None:
+        g = self.state[IDX_G]
+        key = "open" if g == 0.0 else ("hold" if g == 0.5 else "clutch")
+        img = self.robot_images[key]
+        pos = (int(self.state[IDX_RX]), int(self.state[IDX_RY]))
+        self.screen.blit(img, img.get_rect(center=pos))
+
+    def _draw_piping_bag(self) -> None:
+        for name in SPREAD_TYPES:
+            imgs = self.piping_bag_images[name]
+            squeezed = (name == self.held_spread and self.state[IDX_G] == 1.0)
+            img = imgs["squeezed" if squeezed else "normal"]
+
+            if name == self.held_spread:
+                # Draw at robot
+                bag_pos = (int(self.state[IDX_RX]), int(self.state[IDX_RY]))
+                self.screen.blit(img, img.get_rect(center=bag_pos))
+            else:
+                # Draw at its current world position (on tray or wherever it was dropped)
+                bx, by = self.bag_current_pos[name]
+                self.screen.blit(img, (int(bx) - 125, int(by) - 87))
+
+    def _draw_trays(self) -> None:
+        """Draw the top tray bar and four static docking rectangles at anchors."""
+        pygame.draw.rect(self.screen, (245, 215, 181), TOP_TRAY_RECT)
+        for name, (ax, ay) in BAG_ANCHORS.items():
+            color = SPREAD_COLOR[name]
+            dock_rect = self._bag_dock_rect(name)
+            pygame.draw.rect(self.screen, color, dock_rect, 2)
+
+    def _draw_jam(self) -> None:
+        # draw each spread in its own color
+        for name, lines in self.spread_lines.items():
+            if len(lines) > 1:
+                pygame.draw.lines(self.screen, SPREAD_COLOR[name], False, lines, self.JAM_WIDTH)
+
+    def _draw_completed_thumbs(self) -> None:
+        """
+        Draw previously completed toast thumbnails along the top tray,
+        each 75x75 with a 30px buffer.
+        """
+        if not hasattr(self, "completed_thumbs"):
+            return
+        x_start = 20  # left margin
+        y_pos = 20    # keep them above the tray
+        spacing = 75 + 30  # size + buffer
+
+        for i, thumb in enumerate(self.completed_thumbs):
+            self.screen.blit(thumb, (x_start + i * spacing, y_pos))
+    
+    def _draw_bread_boxes_debug(self) -> None:
+        """
+        Temporary debug overlay for bread coverage boxes.
+        Uses self.box_positions (top-left coords) and self.box_size (w,h).
+        """
+        if not hasattr(self, "box_positions") or not hasattr(self, "box_size"):
+            return
+
+        w, h = self.box_size
+        # Semi-transparent layer
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 128, 255, 60))  # RGBA: light blue with alpha
+
         font = pygame.font.SysFont("Arial", 16, bold=True)
-        ep_text = font.render(f"Episode: {episode_num}", True, (0,0,0))
-        self.screen.blit(ep_text, (10, TOP_BAR_H + 6))
 
-    def render(self, episode_num, step_id, screen="help"):
-        # background
-        self.screen.fill((255,255,255))
+        for i, (bx, by) in enumerate(self.box_positions):
+            # Fill (alpha) and outline
+            self.screen.blit(overlay, (int(bx), int(by)))
+            pygame.draw.rect(self.screen, (0, 100, 200), pygame.Rect(int(bx), int(by), w, h), width=2)
 
-        # top bar (wider than bread; spans full CANVAS_W)
-        pygame.draw.rect(self.screen, (234,220,200), pygame.Rect(0, 0, CANVAS_W, TOP_BAR_H))
-        self._draw_top_thumbnails()
+            # Index label in the corner
+            label = font.render(str(i), True, (0, 60, 140))
+            self.screen.blit(label, (int(bx) + 6, int(by) + 4))
 
-        # side panel
-        side_panel_rect = pygame.Rect(CANVAS_W, 0, PANEL_W, VIEWPORT_H)
-        pygame.draw.rect(self.screen, (247,243,238), side_panel_rect)
 
-        # Intervene or instructions
+
+    def render(self, episode_num: int, step_id: int, screen: str = "help") -> None:
+        self.screen.fill((255, 255, 255))
+
+        side_rect = pygame.Rect(SIDE_PANEL_X, SIDE_PANEL_Y, SIDE_PANEL_W, SIDE_PANEL_H)
+        pygame.draw.rect(self.screen, (247, 243, 238), side_rect)
         if screen != "ready":
-            button_rect = pygame.Rect(CANVAS_W + (PANEL_W - 140)//2, (VIEWPORT_H - 40)//2, 140, 44)
-            pygame.draw.rect(self.screen, (255,224,161), button_rect)
-            t = pygame.font.SysFont("Arial", 20, bold=True).render("Intervene", True, (203,91,59))
-            self.screen.blit(t, t.get_rect(center=button_rect.center))
+            self.draw_intervene_button()
         else:
-            f = pygame.font.SysFont("Arial", 14, bold=True)
-            for i, line in enumerate(["Click the dot on the robot arm", "then drag to guide it."]):
-                s = f.render(line, True, (139,69,19))
-                self.screen.blit(s, s.get_rect(center=(CANVAS_W + PANEL_W//2, 300 + i*28)))
+            self.draw_intervene_ready_text()
+        # Sidebar info rows
+        mode_label = "Help" if screen == "help" else ("Ready" if screen == "ready" else "Robot")
+        self._draw_sidebar_info(
+            episode_num=episode_num,
+            spread_name=self.active_spread.capitalize(),
+            mode_name=mode_label
+        )
 
-        # bread
-        self.screen.blit(self.bread_img, self.bread_rect.topleft)
 
-        # selectors & bags
-        self._draw_spread_selectors()
-        self._draw_bags()
+        bread_pos = ((700 - self.bread_img.get_width()) // 2, (VIEWPORT_H - self.bread_img.get_height()) - 30)
+        self.screen.blit(self.bread_img, bread_pos)
 
-        # jam & robot
+        self._draw_bread_boxes_debug()
+
         self._draw_jam()
-        self._draw_robot()
 
-        # endpoint visual (small orange dot)
-        pygame.draw.circle(self.screen, (255,165,0), (int(self.state[4]), int(self.state[5])), 22)
-
-        # mode & ep number
-        font = pygame.font.SysFont("Arial", 16, bold=True)
-        self.screen.blit(font.render(f"Mode: {screen}", True, (0,0,0)), (10, TOP_BAR_H + 28))
-        self.draw_episode_num(episode_num)
-
-        # save current canvas portion if needed (left side only)
-        t = time.time()
-        if t - self.last_save_time >= self.save_interval:
+        # periodic capture (left 700x700 region)
+        if (time.time() - self.last_save_time) >= self.save_interval:
             os.makedirs("jam_state_img/test", exist_ok=True)
             filename = f"jam_state_img/test/episode{episode_num}_step{step_id}.png"
-            subsurf = self.screen.subsurface((0, 0, CANVAS_W, VIEWPORT_H))
+            subsurf = self.screen.subsurface((75, TOP_TRAY_H+100, 550, VIEWPORT_H - TOP_TRAY_H-100))
             pygame.image.save(subsurf, filename)
             self.save_counter += 1
-            self.last_save_time = t
+            self.last_save_time = time.time()
+
+        self._draw_trays()
+        self._draw_piping_bag()
+        self._draw_robot()
+
+        robot_x, robot_y = int(self.state[IDX_RX]), int(self.state[IDX_RY])
+
+        # Draw the tip (small orange dot)
+        pygame.draw.circle(self.screen, (255, 140, 0), (robot_x, robot_y), 6)
+
+        # Draw pickup radius (transparent circle outline)
+        pygame.draw.circle(self.screen, (0, 100, 255), (robot_x, robot_y), PICKUP_RADIUS, 2)
+
+        # Pickup outlines at trays; if holding, draw circle at tip for the held bag
+        for name, (ax, ay) in BAG_ANCHORS.items():
+            color = SPREAD_COLOR[name]
+            if name == self.held_spread:
+                pygame.draw.circle(self.screen, color, (robot_x, robot_y), int(PICKUP_RADIUS), 2)
+            else:
+                pygame.draw.circle(self.screen, color, (int(ax), int(ay)), int(PICKUP_RADIUS), 2)
+
+        self._draw_completed_thumbs()
 
         self.clock.tick(FPS)
         pygame.display.flip()
 
-    def capture_round_thumbnail(self, episode_num, final_step_id):
-        path = f"jam_state_img/test/episode{episode_num}_step{final_step_id}.png"
-        if os.path.exists(path):
-            surf = pygame.image.load(path).convert_alpha()
-            # crop bread area inside the saved canvas (same coords)
-            crop_rect = self.bread_rect.copy()
-            bread_crop = surf.subsurface(crop_rect).copy()
-            bread_small = pygame.transform.smoothscale(bread_crop, (THUMB_W, THUMB_H))
-            self.round_thumbnails.append(bread_small)
 
-# -----------------------------
-# Misc helper
-# -----------------------------
-def controlled_delay(ms):
-    start = pygame.time.get_ticks()
-    while pygame.time.get_ticks() - start < ms:
-        pygame.event.pump()
+# ================
+# Main entry point
+# ================
 
-# -----------------------------
-# Policy helper (unchanged numerics)
-# -----------------------------
-def get_prediction(obs, obs_prev1, obs_prev2, policy_model):
-    # your original normalization constants kept verbatim
-    min_X = np.array([np.float32(90.0), np.float32(78.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(
-        0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(
-        0.0), np.float32(92.0), np.float32(74.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(
-        0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(
-        0.0), np.float32(92.0), np.float32(74.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(
-        0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0), np.float32(0.0)])
-    max_X = np.array([np.float32(573.0), np.float32(524.0), np.float32(1.0), np.float32(1.0), np.float32(0.25068787), np.float32(
-        0.075533986), np.float32(0.25659528), np.float32(0.6491279), np.float32(0.52741855), np.float32(
-        0.40159684), np.float32(0.40303788), np.float32(0.4491095), np.float32(573.0), np.float32(524.0), np.float32(
-        1.0), np.float32(1.0), np.float32(0.25068787), np.float32(0.075533986), np.float32(0.25659528), np.float32(
-        0.6491279), np.float32(0.52741855), np.float32(0.40159684), np.float32(0.40303788), np.float32(
-        0.4491095), np.float32(573.0), np.float32(524.0), np.float32(1.0), np.float32(1.0), np.float32(
-        0.25068787), np.float32(0.075533986), np.float32(0.25659528), np.float32(0.6491279), np.float32(
-        0.52741855), np.float32(0.40159684), np.float32(0.40303788), np.float32(0.4491095)])
-    min_Y = np.array([np.float32(136.0), np.float32(74.0), np.float32(0.0)])
-    max_Y = np.array([np.float32(573.0), np.float32(524.0), np.float32(1.0)])
-
-    input_obs = np.concatenate((obs_prev2[6:], obs_prev1[6:], obs[6:]), axis=0)
-    input_obs = (input_obs - min_X) / (max_X - min_X)
-
-    state_tensor = torch.tensor(np.array(input_obs)).float().unsqueeze(0)
-    with torch.no_grad():
-        action_pred = policy_model(state_tensor)
-        action_pred = action_pred.detach().numpy() * (max_Y - min_Y) + min_Y
-    return action_pred[0]
-
-# -----------------------------
-# Main
-# -----------------------------
 if __name__ == "__main__":
-    try:
-        user_in = input("Enter number of episodes to run (press Enter for 10): ").strip()
-        num_episodes = int(user_in) if user_in else 10
-    except Exception:
-        num_episodes = 10
+    # Load demo episodes (kept to preserve structure; unused in HUMAN_ALWAYS_CONTROL=True
+    with open("jam_all_episodes_gen.pkl", "rb") as f:
+        episodes = pickle.load(f)
+    ep0 = episodes[0]
+    jam_sample_actions = [step.action.tolist() for step in ep0.steps]
+
+    num_episodes = int(input("Enter number of episodes to run: "))
+
+    pygame.init()
+    pygame.display.init()
 
     env = JamSpreadingEnv()
+    action: Optional[np.ndarray] = None
+    context: Optional[str] = None
 
-    # policy (unchanged)
+    # Load policy only when not human-only
     action_dim = 3
-    state_dim = 36
-    cont_policy = Continuous_Policy(state_dim=state_dim, output_dim=action_dim)
-    cont_policy.load_state_dict(torch.load('cont_policy.pth'))
-    cont_policy.eval()
+    state_dim = 36  # legacy; policy is not used in HUMAN_ALWAYS_CONTROL mode
+    cont_policy: Optional[Continuous_Policy] = None
+    if not HUMAN_ALWAYS_CONTROL:
+        cont_policy = Continuous_Policy(state_dim=state_dim, output_dim=action_dim)
+        try:
+            state_dict = torch.load("cont_policy.pth", map_location="cpu", weights_only=True)  # newer torch
+        except TypeError:
+            state_dict = torch.load("cont_policy.pth", map_location="cpu")  # older torch
+        cont_policy.load_state_dict(state_dict)
+        cont_policy.eval()
 
     for episode_num in range(num_episodes):
         obs, _ = env.reset()
+        env._load_completed_thumbs()  # refresh the thumbnails for this episode
         obs_prev1 = obs.copy()
         obs_prev2 = obs.copy()
+
         done = False
+        next_action_idx = 0
+        next_action = jam_sample_actions[next_action_idx]
+        help_start_time: Optional[float] = None
         screen_state = "robot"
         last_help_check_time = time.time()
         episode = Episode(episode_num)
+        space_was_down = False
+        env.manual_end = False
         step_id = 0
 
-        # conformal params (kept)
+        # Conformal tracking vars (kept; used only if not human-only)
         q_lo = np.array([0.1, 0.1, 0.1])
         q_hi = np.array([0.1, 0.1, 0.1])
         stepsize = 0.2
         alpha_desired = 0.8
-        history_upper_residuals, history_lower_residuals = [], []
+        list_of_uncertainties: List[float] = []
+        list_of_residuals: List[float] = []
+        history_upper_residuals: List[np.ndarray] = []
+        history_lower_residuals: List[np.ndarray] = []
         B_t_lookback_window = 100
 
         while not done:
-            robot_prediction = get_prediction(obs, obs_prev1, obs_prev2, cont_policy)
-
-            if screen_state == "robot":
-                need_help = False
-                if time.time() - last_help_check_time >= 2.0:
-                    uncertainty_at_timestep = np.linalg.norm(q_hi + q_lo)
-                    need_help = uncertainty_at_timestep > 10
-
-                if env.check_intervene_click():
-                    screen_state = "ready"
-                    context = "human_intervened"
-                elif need_help:
-                    screen_state = "ready"
-                    context = "robot_asked"
-                else:
-                    action = robot_prediction
-                    context = "robot_independent"
-
-            elif screen_state == "ready":
-                if env.ready_to_help():
-                    screen_state = "help"
-                    help_start_time = time.time()
-                else:
-                    env.render(episode_num, step_id, screen_state)
-                    time.sleep(1/10)
-                    continue
-
-            elif screen_state == "help":
+            if HUMAN_ALWAYS_CONTROL:
+                screen_state = "help"
+                context = "human_intervened"
                 action = env.get_help()
-                if time.time() - help_start_time >= 3.0:
-                    last_help_check_time = time.time()
-                    screen_state = "robot"
+                robot_prediction = None
 
-                # conformal updates
-                expert_y = action
-                y_pred = robot_prediction
-                shi = expert_y - y_pred
-                slo = y_pred - expert_y
+                keys = pygame.key.get_pressed()
+                if keys[pygame.K_SPACE] and not space_was_down:
+                    env.save_completed_toast(episode_num)
+                    env.manual_end = True
+                    controlled_delay(3000)
 
-                err_hi = (shi > q_hi).astype(float)
-                err_lo = (slo > q_lo).astype(float)
 
-                B_hi = np.ones(action_dim) * 0.01
-                B_lo = np.ones(action_dim) * 0.01
-                if history_upper_residuals:
-                    B_hi = np.max(history_upper_residuals, axis=0)
-                    B_lo = np.max(history_lower_residuals, axis=0)
+            else:
+                robot_prediction = get_prediction(obs, obs_prev1, obs_prev2, cont_policy)
+                print("robot_prediction", robot_prediction)
 
-                history_upper_residuals.append(shi)
-                history_lower_residuals.append(slo)
-                if len(history_upper_residuals) > B_t_lookback_window:
-                    history_upper_residuals.pop(0)
-                    history_lower_residuals.pop(0)
+                if screen_state == "robot":
+                    need_help = False
+                    if time.time() - last_help_check_time >= 2.0:
+                        uncertainty_at_timestep = np.linalg.norm(q_hi + q_lo)
+                        print("uncertainty_at_timestep", uncertainty_at_timestep)
+                        list_of_uncertainties.append(float(uncertainty_at_timestep))
+                        need_help = uncertainty_at_timestep > 10
 
-                q_hi = q_hi + stepsize * B_hi * (err_hi - alpha_desired)
-                q_lo = q_lo + stepsize * B_lo * (err_lo - alpha_desired)
+                    if env.check_intervene_click():
+                        screen_state = "ready"
+                        context = "human_intervened"
+                    elif need_help:
+                        screen_state = "ready"
+                        context = "robot_asked"
+                    else:
+                        action = robot_prediction
+                        context = "robot_independent"
+                        screen_state = "robot"
 
-            # advance env
+                elif screen_state == "ready":
+                    if env.ready_to_help():
+                        screen_state = "help"
+                        help_start_time = time.time()
+                    else:
+                        env.render(episode_num, step_id, screen_state)
+                        time.sleep(1 / 10)
+                        continue
+
+                elif screen_state == "help":
+                    action = env.get_help()
+
+                    if help_start_time and time.time() - help_start_time >= 3.0:
+                        # Snap back to nearest script point (unchanged)
+                        rx, ry = env.state[IDX_RX], env.state[IDX_RY]
+                        min_dist = float("inf")
+                        best_idx = next_action_idx
+                        for i in range(len(jam_sample_actions)):
+                            ax, ay = jam_sample_actions[i][0], jam_sample_actions[i][1]
+                            d = ((ax - rx) ** 2 + (ay - ry) ** 2) ** 0.5
+                            if d < min_dist:
+                                min_dist = d
+                                best_idx = i
+                        next_action_idx = best_idx
+                        next_action = jam_sample_actions[next_action_idx]
+                        last_help_check_time = time.time()
+                        screen_state = "robot"
+
+                    # Conformal stats (unchanged)
+                    expert_y = action
+                    y_pred = robot_prediction
+                    shi_upper_residual = expert_y - y_pred
+                    slo_lower_residual = y_pred - expert_y
+                    list_of_residuals.append(float(np.linalg.norm(np.abs(expert_y - y_pred))))
+
+                    err_hi = np.zeros(action_dim)
+                    err_lo = np.zeros(action_dim)
+                    for i in range(action_dim):
+                        if shi_upper_residual[i] > q_hi[i]:
+                            err_hi[i] = 1
+                        if slo_lower_residual[i] > q_lo[i]:
+                            err_lo[i] = 1
+                    print("err_hi", err_hi)
+                    print("err_lo", err_lo)
+                    covered = sum(err_hi) + sum(err_lo)
+                    covered = 0 if covered > 0 else 1
+                    print("covered", covered)
+
+                    B_hi = np.ones(action_dim) * 0.01
+                    B_lo = np.ones(action_dim) * 0.01
+                    if len(history_upper_residuals) > 0:
+                        B_hi = np.max(history_upper_residuals, axis=0)
+                        B_lo = np.max(history_lower_residuals, axis=0)
+
+                    history_upper_residuals.append(shi_upper_residual)
+                    history_lower_residuals.append(slo_lower_residual)
+                    if len(history_upper_residuals) > B_t_lookback_window:
+                        history_upper_residuals.pop(0)
+                        history_lower_residuals.pop(0)
+
+                    q_hi = q_hi + (stepsize) * B_hi * (err_hi - alpha_desired)
+                    q_lo = q_lo + (stepsize) * B_lo * (err_lo - alpha_desired)
+
+            # Book-keeping
             obs_prev2 = obs_prev1
             obs_prev1 = obs
-            if screen_state != "ready":
-                obs, _, done, _, _ = env.step(action)
-                img_path = f"jam_state_img/test/episode{episode_num}_step{step_id}.png"
-                timestep = TimeStep(
-                    step_id=step_id,
-                    action=action,
-                    state_v=obs,
-                    state_img_path=img_path,
-                    context=context,
-                    robot_prediction=robot_prediction
-                )
-                episode.add_step(timestep)
+
+            if action is not None:
+                # Defensive guard that does not change your logic:
+                # skip step if NaN/Inf; otherwise clamp into action box
+                if not np.all(np.isfinite(action)):
+                    print("Skipping step due to invalid action:", action)
+                else:
+                    # action = np.clip(action, env.action_space.low, env.action_space.high)
+                    obs, _, done, _, _ = env.step(action)
+
+                    os.makedirs("jam_state_img/test", exist_ok=True)
+                    img_path = f"jam_state_img/test/episode{episode_num}_step{step_id}.png"
+                    timestep = TimeStep(
+                        step_id=step_id,
+                        action=action,
+                        state_v=obs,
+                        state_img_path=img_path,
+                        context=context,
+                        robot_prediction=None if HUMAN_ALWAYS_CONTROL else robot_prediction,
+                    )
+                    episode.add_step(timestep)
 
             env.render(episode_num, step_id, screen_state)
             step_id += 1
-            time.sleep(1/10)
+            time.sleep(1 / 10)
 
-        # when done, capture thumbnail and allow next round
-        env.capture_round_thumbnail(episode_num, max(step_id-1, 0))
         print(f"Episode {episode_num} ended.")
-        controlled_delay(1200)
+        controlled_delay(3000)
 
     env.close()
     del env
