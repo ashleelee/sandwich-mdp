@@ -61,15 +61,18 @@ INFO_BOX_FILL    = (255, 244, 226)
 INFO_TEXT_COLOR  = (102, 73, 45)
 
 # =========================
-# state layout (12-D)
-# [ rx, ry, g, holding, coverage[8] ]
+# state layout (17-D)
+# [ rx, ry, g, holding, coverage[8], spread_comp[4], bread_idx ]
 # =========================
-IDX_RX = 0           # robot x
-IDX_RY = 1           # robot y
-IDX_G  = 2           # gripper (0.0 open, 0.5 hold, 1.0 clutch)
-IDX_H  = 3           # holding flag (0.0/1.0)
-IDX_C0 = 4           # coverage[0] starts here (8 cells total)
-STATE_DIM = 12
+IDX_RX = 0
+IDX_RY = 1
+IDX_G  = 2
+IDX_H  = 3
+IDX_C0 = 4                 # coverage[0]..coverage[7]
+IDX_SC0 = 12               # spread_comp[0]..spread_comp[3]
+IDX_BI = 16                # bread index (float)
+
+STATE_DIM = 17
 
 # ======================
 # Helper / utility funcs
@@ -129,12 +132,14 @@ class JamSpreadingEnv(gym.Env):
         self.held_spread = None                                   # None or one of SPREAD_TYPES
         self.bag_current_pos = dict(BAG_ANCHORS)                  # each bag's current location (follows robot when held)
 
-        # 12-D state
+        # 17-D state
         self.state = np.array([
-            90.0, 90.0,   # rx, ry
-            0.0,          # gripper (open)
-            0.0,          # holding flag
-            *([0.0] * 8)  # coverage for 8 boxes
+            90.0, 90.0,           # rx, ry
+            0.0,                  # gripper
+            0.0,                  # holding flag
+            *([0.0] * 8),         # coverage
+            *([0.0] * 4),         # spread composition [jam, peanut, nutella, avocado]
+            0.0                   # bread index
         ], dtype=np.float32)
 
         # Spaces
@@ -144,8 +149,8 @@ class JamSpreadingEnv(gym.Env):
             dtype=np.float32
         )
         self.observation_space = spaces.Box(
-            low=np.array([0.0, 0.0, 0.0, 0.0] + [0.0] * 8, dtype=np.float32),
-            high=np.array([VIEWPORT_W, VIEWPORT_H, 1.0, 1.0] + [1.0] * 8, dtype=np.float32),
+            low=np.array([0.0, 0.0, 0.0, 0.0] + [0.0]*8 + [0.0]*4 + [0.0], dtype=np.float32),
+            high=np.array([VIEWPORT_W, VIEWPORT_H, 1.0, 1.0] + [1.0]*8 + [1.0]*4 + [10.0], dtype=np.float32),
             dtype=np.float32
         )
 
@@ -225,11 +230,13 @@ class JamSpreadingEnv(gym.Env):
 
     def reset(self, seed: Optional[int] = None, options=None) -> Tuple[np.ndarray, dict]:
         super().reset(seed=seed)
-        self.state[:] = np.array([
-            90.0, 90.0,   # rx, ry
-            0.0,          # gripper open
-            0.0,          # holding flag
-            *([0.0] * 8)  # coverage
+        self.state = np.array([
+            90.0, 90.0,           # rx, ry
+            0.0,                  # gripper
+            0.0,                  # holding flag
+            *([0.0] * 8),         # coverage
+            *([0.0] * 4),         # spread composition [jam, peanut, nutella, avocado]
+            0.0                   # bread index
         ], dtype=np.float32)
 
         self.jam_lines.clear()
@@ -238,6 +245,8 @@ class JamSpreadingEnv(gym.Env):
         self._update_goal()
         self.held_spread = None
         self.bag_current_pos = dict(BAG_ANCHORS)
+
+        self.state[IDX_BI] = float(self.current_bread_index)
 
         self.done = False
         self.last_gripper_state = 0.5
@@ -296,6 +305,8 @@ class JamSpreadingEnv(gym.Env):
                 lines = self.spread_lines[self.held_spread]
                 if (not lines) or (jam_point != lines[-1]):
                     lines.append(jam_point)
+                    # update spread composition ratio
+                    self._update_spread_composition()
 
         # --- Release logic: only drop if the TIP is inside this bag's dock square ---
         if self.held_spread is not None and gripper_state == 0.0:
@@ -317,6 +328,28 @@ class JamSpreadingEnv(gym.Env):
     def _update_goal(self) -> None:
         """Update the one-hot goal vector based on current active_spread."""
         self.goal = [1 if name == self.active_spread else 0 for name in SPREAD_TYPES]
+    
+    def _update_spread_composition(self) -> None:
+        # Compute per-spread “painted” area inside bread, then normalize to fractions
+        per_spread_area = {name: 0.0 for name in SPREAD_TYPES}
+        for name, lines in self.spread_lines.items():
+            if len(lines) < 2:
+                continue
+            for p1, p2 in zip(lines[:-1], lines[1:]):
+                per_spread_area[name] += self._seg_area_inside_bread(p1, p2, self.JAM_WIDTH)
+
+        total = sum(per_spread_area.values())
+        if total <= 1e-8:
+            comps = [0.0, 0.0, 0.0, 0.0]
+        else:
+            comps = [per_spread_area["jam"]/total,
+                    per_spread_area["peanut"]/total,
+                    per_spread_area["nutella"]/total,
+                    per_spread_area["avocado"]/total]
+
+        # Write into state
+        self.state[IDX_SC0+0:IDX_SC0+4] = np.asarray(comps, dtype=np.float32)
+
 
 
     def _update_jam_coverage_area(self) -> None:
@@ -342,6 +375,34 @@ class JamSpreadingEnv(gym.Env):
                     box_areas_covered[j] += (overlap_area / denom) * seg_area
         for i in range(8):
             self.state[IDX_C0 + i] = min(box_areas_covered[i] / self.box_area, 1.0)
+    
+    def _bread_union_rects(self) -> list[pygame.Rect]:
+        # Return the 8 coverage box rects as the “toast” area
+        return [pygame.Rect(int(bx), int(by), int(self.box_size[0]), int(self.box_size[1]))
+                for (bx, by) in self.box_positions]
+
+    def _seg_area_inside_bread(self, p1: tuple[int,int], p2: tuple[int,int], width: int) -> float:
+        # Rectangle that approximates the thick line segment
+        x1, y1 = p1; x2, y2 = p2
+        dx, dy = abs(x2 - x1), abs(y2 - y1)
+        seg_len = max(dx, dy)
+        seg_area = seg_len * width
+        min_x = min(x1, x2) - width // 2
+        min_y = min(y1, y2) - width // 2
+        max_x = max(x1, x2) + width // 2
+        max_y = max(y1, y2) + width // 2
+        seg_rect = pygame.Rect(min_x, min_y, max_x - min_x, max_y - min_y)
+
+        # Approximate intersection with toast by summing intersections with the 8 boxes
+        inside_area = 0.0
+        for box_rect in self._bread_union_rects():
+            inter = seg_rect.clip(box_rect)
+            if inter.width > 0 and inter.height > 0:
+                # allocate proportionally from the seg_rect area to the thick line area
+                denom = max(seg_rect.width * seg_rect.height, 1)
+                inside_area += (inter.width * inter.height) / denom * seg_area
+        return inside_area
+
 
     def _is_done(self) -> bool:
         if self.manual_end:
@@ -484,19 +545,6 @@ class JamSpreadingEnv(gym.Env):
         pygame.image.save(canvas, filename)
         print(f"Saved completed toast -> {filename}")
         return filename
-
-
-    # def save_completed_toast(self, episode_num: int) -> str:
-    #     """
-    #     Save the current toast into jam_state_img/completed/
-    #     with filename = {episode_num}.png
-    #     """
-    #     os.makedirs("jam_state_img/completed", exist_ok=True)
-    #     filename = f"jam_state_img/completed/{episode_num}.png"
-    #     subsurf = self.screen.subsurface((75, TOP_TRAY_H+100, 550, VIEWPORT_H - TOP_TRAY_H-100))
-    #     pygame.image.save(subsurf, filename)
-    #     print(f"Saved completed toast -> {filename}")
-    #     return filename
     
     def _load_completed_thumbs(self) -> None:
         """Load all completed toasts as 75×75 thumbnails with 30px spacing."""
@@ -631,6 +679,30 @@ class JamSpreadingEnv(gym.Env):
             # Index label in the corner
             label = font.render(str(i), True, (0, 60, 140))
             self.screen.blit(label, (int(bx) + 6, int(by) + 4))
+    
+    def _draw_state_tail_debug(self) -> None:
+        """Display the last 5 elements of the state vector on screen for debugging."""
+        tail = self.state[-5:]  # [comp1, comp2, comp3, comp4, bread_idx]
+        font = pygame.font.SysFont("Arial", 18, bold=True)
+        x, y = 20, 20  # top-left corner of the main window
+
+        # background box for clarity
+        bg_rect = pygame.Rect(x - 10, y - 10, 280, 150)
+        pygame.draw.rect(self.screen, (250, 245, 230), bg_rect)
+        pygame.draw.rect(self.screen, (150, 120, 90), bg_rect, width=2)
+
+        # draw text lines
+        lines = [
+            f"jam:     {tail[0]:.2f}",
+            f"peanut:  {tail[1]:.2f}",
+            f"nutella: {tail[2]:.2f}",
+            f"avocado: {tail[3]:.2f}",
+            f"bread idx: {tail[4]:.0f}"
+        ]
+        for i, text in enumerate(lines):
+            surf = font.render(text, True, (80, 50, 20))
+            self.screen.blit(surf, (x, y + i * 25))
+
 
 
 
@@ -689,6 +761,7 @@ class JamSpreadingEnv(gym.Env):
             else:
                 pygame.draw.circle(self.screen, color, (int(ax), int(ay)), int(PICKUP_RADIUS), 2)
 
+        self._draw_state_tail_debug()
         
 
         self.clock.tick(FPS)
@@ -705,6 +778,8 @@ if __name__ == "__main__":
         episodes = pickle.load(f)
     ep0 = episodes[0]
     jam_sample_actions = [step.action.tolist() for step in ep0.steps]
+
+    all_episodes = []
 
     num_episodes = int(input("Enter number of episodes to run: "))
 
@@ -729,6 +804,9 @@ if __name__ == "__main__":
         cont_policy.eval()
 
     for episode_num in range(num_episodes):
+        
+        env.current_bread_index = episode_num
+
         obs, _ = env.reset()
         env._load_completed_thumbs()  # refresh the thumbnails for this episode
         obs_prev1 = obs.copy()
@@ -882,12 +960,14 @@ if __name__ == "__main__":
                     episode.add_step(timestep)
 
             env.render(episode_num, step_id, screen_state)
+
             step_id += 1
             time.sleep(1 / 10)
 
         print(f"Episode {episode_num} ended.")
+        all_episodes.append(episode)
         controlled_delay(3000)
-
+    
     env.close()
     del env
     if pygame.get_init():

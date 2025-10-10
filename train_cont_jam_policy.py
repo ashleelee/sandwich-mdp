@@ -39,16 +39,7 @@ all_X = (all_X - min_X) / (max_X - min_X)
 min_Y = np.min(all_Y, axis=0)
 max_Y = np.max(all_Y, axis=0)
 all_Y = (all_Y - min_Y) / (max_Y - min_Y)
-# min_X = list(min_X)
-# max_X = list(max_X)
-# min_Y = list(min_Y)
-# max_Y = list(max_Y)
-# print("min_X", min_X)
-# print("max_X", max_X)
-# print("min_Y", min_Y)
-# print("max_Y", max_Y)
-# print("(max_X - min_X)", (max_X - min_X))
-# count nans in all_X and all_Y
+
 print("nans in all_X", np.isnan(all_X).sum())
 print("nans in all_Y", np.isnan(all_Y).sum())
 
