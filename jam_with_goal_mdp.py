@@ -33,6 +33,7 @@ SIDE_PANEL_H = VIEWPORT_H - SIDE_PANEL_Y
 # Top tray bar and bag placement
 TOP_TRAY_H = 150
 TOP_TRAY_RECT = pygame.Rect(0, 0, VIEWPORT_W, TOP_TRAY_H)
+TOP_TRAY_COLOR = (245, 215, 181)
 
 # Spread
 SPREAD_TYPES = ["jam", "peanut", "nutella", "avocado"]
@@ -435,17 +436,67 @@ class JamSpreadingEnv(gym.Env):
         ax, ay = BAG_ANCHORS[name]
         return np.hypot(bx - ax, by - ay) <= PICKUP_RADIUS
 
-    def save_completed_toast(self, episode_num: int) -> str:
+    def _render_toast_region(self, surface: pygame.Surface, bg_color=None) -> None:
         """
-        Save the current toast into jam_state_img/completed/
-        with filename = {episode_num}.png
+        Draw the toast area (bread + jam lines) into `surface`, whose size must match
+        the captured region: (550, VIEWPORT_H - TOP_TRAY_H - 100).
+        """
+        # --- Region geometry (same as your subsurface slice) ---
+        cap_x, cap_y = 75, TOP_TRAY_H + 100
+        cap_w, cap_h = 550, (VIEWPORT_H - TOP_TRAY_H - 100)
+
+        # Adjust background color to that of the top tray
+        if TOP_TRAY_COLOR is not None:
+            surface.fill(TOP_TRAY_COLOR)
+
+        # --- Bread position (convert from screen coords to local coords in surface) ---
+        bread_pos_screen = ((700 - self.bread_img.get_width()) // 2,
+                            (VIEWPORT_H - self.bread_img.get_height()) - 30)
+        bread_pos_local = (bread_pos_screen[0] - cap_x, bread_pos_screen[1] - cap_y)
+        surface.blit(self.bread_img, bread_pos_local)
+
+        # --- Draw jam for each spread, offsetting into local coords ---
+        jam_width = self.JAM_WIDTH
+        for name, lines in self.spread_lines.items():
+            if len(lines) > 1:
+                # Offset all points by (-cap_x, -cap_y)
+                local_pts = [(px - cap_x, py - cap_y) for (px, py) in lines]
+                pygame.draw.lines(surface, SPREAD_COLOR[name], False, local_pts, jam_width)
+
+    def save_completed_toast(self, episode_num: int, bg_color=(245, 235, 220)) -> str:
+        """
+        Save the current toast **re-rendered** onto a custom background color.
+        Default bg_color is a warm beige; pass None to keep transparency
+        (PNG with alpha) if you create the surface with SRCALPHA.
         """
         os.makedirs("jam_state_img/completed", exist_ok=True)
         filename = f"jam_state_img/completed/{episode_num}.png"
-        subsurf = self.screen.subsurface((75, TOP_TRAY_H+100, 550, VIEWPORT_H - TOP_TRAY_H-100))
-        pygame.image.save(subsurf, filename)
+
+        # Make an off-screen canvas the same size as your previous crop
+        cap_w, cap_h = 550, (VIEWPORT_H - TOP_TRAY_H - 100)
+        # Use SRCALPHA so we can support transparent backgrounds if bg_color=None
+        canvas = pygame.Surface((cap_w, cap_h), pygame.SRCALPHA)
+
+        # Re-render the toast area onto this canvas
+        self._render_toast_region(canvas, bg_color=bg_color)
+
+        # Save the off-screen render
+        pygame.image.save(canvas, filename)
         print(f"Saved completed toast -> {filename}")
         return filename
+
+
+    # def save_completed_toast(self, episode_num: int) -> str:
+    #     """
+    #     Save the current toast into jam_state_img/completed/
+    #     with filename = {episode_num}.png
+    #     """
+    #     os.makedirs("jam_state_img/completed", exist_ok=True)
+    #     filename = f"jam_state_img/completed/{episode_num}.png"
+    #     subsurf = self.screen.subsurface((75, TOP_TRAY_H+100, 550, VIEWPORT_H - TOP_TRAY_H-100))
+    #     pygame.image.save(subsurf, filename)
+    #     print(f"Saved completed toast -> {filename}")
+    #     return filename
     
     def _load_completed_thumbs(self) -> None:
         """Load all completed toasts as 75×75 thumbnails with 30px spacing."""
@@ -604,7 +655,7 @@ class JamSpreadingEnv(gym.Env):
         bread_pos = ((700 - self.bread_img.get_width()) // 2, (VIEWPORT_H - self.bread_img.get_height()) - 30)
         self.screen.blit(self.bread_img, bread_pos)
 
-        self._draw_bread_boxes_debug()
+        # self._draw_bread_boxes_debug()
 
         self._draw_jam()
 
@@ -618,6 +669,7 @@ class JamSpreadingEnv(gym.Env):
             self.last_save_time = time.time()
 
         self._draw_trays()
+        self._draw_completed_thumbs()
         self._draw_piping_bag()
         self._draw_robot()
 
@@ -637,7 +689,7 @@ class JamSpreadingEnv(gym.Env):
             else:
                 pygame.draw.circle(self.screen, color, (int(ax), int(ay)), int(PICKUP_RADIUS), 2)
 
-        self._draw_completed_thumbs()
+        
 
         self.clock.tick(FPS)
         pygame.display.flip()
