@@ -22,7 +22,9 @@ VIEWPORT_W = 1000
 VIEWPORT_H = 800
 
 # Control Toggle
-HUMAN_ALWAYS_CONTROL = True
+HUMAN_ALWAYS_CONTROL = False   # run the robot policy
+MODEL_PATH = "cont_policy_with_goal_2.pth"
+STATS_PATH = "minmax_stats_with_goal.npz"
 
 # Side panel geometry
 SIDE_PANEL_X = 800
@@ -85,17 +87,54 @@ def controlled_delay(delay_ms: int) -> None:
         pygame.event.pump()
 
 
+def get_prediction_prev(
+    obs: np.ndarray,
+    obs_prev1: np.ndarray,
+    obs_prev2: np.ndarray,
+    policy_model: Continuous_Policy,
+    x_min: np.ndarray,
+    x_max: np.ndarray,
+    y_min: np.ndarray,
+    y_max: np.ndarray,
+) -> np.ndarray:
+    """
+    Build the 51-D input [s_t, s_{t+1}, s_{t+2}], apply the SAME min–max
+    normalization used during training, run the policy, and de-normalize
+    the predicted action back to env units (pixels, gripper in [0,1]).
+    """
+    x = np.concatenate([obs, obs_prev1, obs_prev2]).astype(np.float32)  # shape (51,)
+    x_n = (x - x_min) / (x_max - x_min + 1e-8)
+
+    with torch.no_grad():
+        xt = torch.from_numpy(x_n).unsqueeze(0).float()  # (1, 51)
+        y_n = policy_model(xt).cpu().numpy()[0]          # normalized action
+    y = y_n * (y_max - y_min + 1e-8) + y_min
+    print(y.astype(np.float32))            # de-normalized action
+    return y.astype(np.float32)                          # expected: [x,y,g]
+
 def get_prediction(
     obs: np.ndarray,
     obs_prev1: np.ndarray,
     obs_prev2: np.ndarray,
     policy_model: Continuous_Policy,
+    x_min: np.ndarray,
+    x_max: np.ndarray,
+    y_min: np.ndarray,
+    y_max: np.ndarray,
 ) -> np.ndarray:
-    """
-    Placeholder to keep compatibility with the old call sites.
-    Your policy normalizer for 12-D is deferred for now.
-    """
-    raise NotImplementedError("Robot policy not wired for 12-D state yet. Set HUMAN_ALWAYS_CONTROL = True.")
+    # x = np.concatenate([obs, obs_prev1, obs_prev2]).astype(np.float32)
+    x = np.concatenate([obs_prev2, obs_prev1, obs]).astype(np.float32)
+    x_n = (x - x_min) / x_range           # <= use safe range
+
+    with torch.no_grad():
+        xt = torch.from_numpy(x_n).unsqueeze(0).float()
+        action_pred = policy_model(xt).cpu().numpy()[0]
+
+    action_pred = np.clip(action_pred, 0.0, 1.0)          # normalized outputs were trained in [0,1]
+    action_pred = action_pred * y_range + y_min             # <= use safe range
+
+    return action_pred.astype(np.float32)
+
 
 
 # ==========================
@@ -761,50 +800,69 @@ class JamSpreadingEnv(gym.Env):
             else:
                 pygame.draw.circle(self.screen, color, (int(ax), int(ay)), int(PICKUP_RADIUS), 2)
 
-        self._draw_state_tail_debug()
+        # self._draw_state_tail_debug()
         
 
         self.clock.tick(FPS)
         pygame.display.flip()
 
 
-# ================
-# Main entry point
-# ================
-
+# main entry point
 if __name__ == "__main__":
-    # Load demo episodes (kept to preserve structure; unused in HUMAN_ALWAYS_CONTROL=True
-    with open("jam_all_episodes_gen.pkl", "rb") as f:
-        episodes = pickle.load(f)
-    ep0 = episodes[0]
-    jam_sample_actions = [step.action.tolist() for step in ep0.steps]
-
     all_episodes = []
-
     num_episodes = int(input("Enter number of episodes to run: "))
-
+    
     pygame.init()
     pygame.display.init()
 
     env = JamSpreadingEnv()
-    action: Optional[np.ndarray] = None
-    context: Optional[str] = None
 
-    # Load policy only when not human-only
+    # Show *something* even if the policy path errors after
+    env.render(episode_num=0, step_id=0, screen="robot")
+    pygame.event.pump()
+    pygame.display.flip()
+    pygame.time.wait(50)
+
+    # load policy
     action_dim = 3
-    state_dim = 36  # legacy; policy is not used in HUMAN_ALWAYS_CONTROL mode
-    cont_policy: Optional[Continuous_Policy] = None
+    state_dim = 17 * 3  
+    cont_policy = Continuous_Policy(state_dim=state_dim, output_dim=action_dim)
+    sd = torch.load(MODEL_PATH, map_location="cpu")
+    cont_policy.load_state_dict(sd, strict=False)
+    cont_policy.eval()
+
     if not HUMAN_ALWAYS_CONTROL:
-        cont_policy = Continuous_Policy(state_dim=state_dim, output_dim=action_dim)
-        try:
-            state_dict = torch.load("cont_policy.pth", map_location="cpu", weights_only=True)  # newer torch
-        except TypeError:
-            state_dict = torch.load("cont_policy.pth", map_location="cpu")  # older torch
-        cont_policy.load_state_dict(state_dict)
-        cont_policy.eval()
+
+        # store these to use in get_prediction
+        stats = np.load(STATS_PATH)
+        x_min = stats["x_min"].astype(np.float32)
+        x_max = stats["x_max"].astype(np.float32)
+        y_min = stats["y_min"].astype(np.float32)
+        y_max = stats["y_max"].astype(np.float32)
+
+        assert x_min.shape[0] == state_dim, f"x_min dim {x_min.shape[0]} != {state_dim}"
+        assert x_max.shape[0] == state_dim, f"x_max dim {x_max.shape[0]} != {state_dim}"
+        assert y_min.shape[0] == action_dim and y_max.shape[0] == action_dim
+
+        x_range = (x_max - x_min).astype(np.float32)
+        y_range = (y_max - y_min).astype(np.float32)
+
+        const_x_mask = x_range <= 1e-8
+        const_y_mask = y_range <= 1e-8
+
+        if np.any(const_x_mask):
+            idx = np.where(const_x_mask)[0]
+            print("[WARN] Constant input feature(s) in stats at indices:", idx.tolist())
+            # Avoid divide-by-zero; normalized value doesn't matter (always same), set scale to 1
+            x_range[const_x_mask] = 1.0
+
+        if np.any(const_y_mask):
+            idx = np.where(const_y_mask)[0]
+            print("[WARN] Constant target dim(s) in stats at indices:", idx.tolist())
+            y_range[const_y_mask] = 1.0
 
     for episode_num in range(num_episodes):
-        
+        robot_prediction = None
         env.current_bread_index = episode_num
 
         obs, _ = env.reset()
@@ -813,8 +871,6 @@ if __name__ == "__main__":
         obs_prev2 = obs.copy()
 
         done = False
-        next_action_idx = 0
-        next_action = jam_sample_actions[next_action_idx]
         help_start_time: Optional[float] = None
         screen_state = "robot"
         last_help_check_time = time.time()
@@ -824,15 +880,15 @@ if __name__ == "__main__":
         step_id = 0
 
         # Conformal tracking vars (kept; used only if not human-only)
-        q_lo = np.array([0.1, 0.1, 0.1])
-        q_hi = np.array([0.1, 0.1, 0.1])
-        stepsize = 0.2
-        alpha_desired = 0.8
-        list_of_uncertainties: List[float] = []
-        list_of_residuals: List[float] = []
-        history_upper_residuals: List[np.ndarray] = []
-        history_lower_residuals: List[np.ndarray] = []
-        B_t_lookback_window = 100
+        # q_lo = np.array([0.1, 0.1, 0.1])
+        # q_hi = np.array([0.1, 0.1, 0.1])
+        # stepsize = 0.2
+        # alpha_desired = 0.8
+        # list_of_uncertainties: List[float] = []
+        # list_of_residuals: List[float] = []
+        # history_upper_residuals: List[np.ndarray] = []
+        # history_lower_residuals: List[np.ndarray] = []
+        # B_t_lookback_window = 100
 
         while not done:
             if HUMAN_ALWAYS_CONTROL:
@@ -846,98 +902,115 @@ if __name__ == "__main__":
                     env.save_completed_toast(episode_num)
                     env.manual_end = True
                     controlled_delay(3000)
-
-
             else:
-                robot_prediction = get_prediction(obs, obs_prev1, obs_prev2, cont_policy)
-                print("robot_prediction", robot_prediction)
+                
+                # pure robot mode, no ask-for-help logic
+                action = get_prediction(
+                    obs, obs_prev1, obs_prev2,
+                    cont_policy, x_min, x_max, y_min, y_max
+                )
+                
+                g = action[2]
+                action[2] = min([0.0, 0.5, 1.0], key=lambda v: abs(v-g))
+                
+                # clip to env action space just in case
+                action = np.clip(action, env.action_space.low, env.action_space.high)
+                
+                context = "robot_independent"
+                screen_state = "robot"
+                print(action)
 
-                if screen_state == "robot":
-                    need_help = False
-                    if time.time() - last_help_check_time >= 2.0:
-                        uncertainty_at_timestep = np.linalg.norm(q_hi + q_lo)
-                        print("uncertainty_at_timestep", uncertainty_at_timestep)
-                        list_of_uncertainties.append(float(uncertainty_at_timestep))
-                        need_help = uncertainty_at_timestep > 10
 
-                    if env.check_intervene_click():
-                        screen_state = "ready"
-                        context = "human_intervened"
-                    elif need_help:
-                        screen_state = "ready"
-                        context = "robot_asked"
-                    else:
-                        action = robot_prediction
-                        context = "robot_independent"
-                        screen_state = "robot"
+            # else:
+            #     robot_prediction = get_prediction(obs, obs_prev1, obs_prev2, cont_policy)
+            #     print("robot_prediction", robot_prediction)
 
-                elif screen_state == "ready":
-                    if env.ready_to_help():
-                        screen_state = "help"
-                        help_start_time = time.time()
-                    else:
-                        env.render(episode_num, step_id, screen_state)
-                        time.sleep(1 / 10)
-                        continue
+            #     if screen_state == "robot":
+            #         need_help = False
+            #         if time.time() - last_help_check_time >= 2.0:
+            #             uncertainty_at_timestep = np.linalg.norm(q_hi + q_lo)
+            #             print("uncertainty_at_timestep", uncertainty_at_timestep)
+            #             list_of_uncertainties.append(float(uncertainty_at_timestep))
+            #             need_help = uncertainty_at_timestep > 10
 
-                elif screen_state == "help":
-                    action = env.get_help()
+            #         if env.check_intervene_click():
+            #             screen_state = "ready"
+            #             context = "human_intervened"
+            #         elif need_help:
+            #             screen_state = "ready"
+            #             context = "robot_asked"
+            #         else:
+            #             action = robot_prediction
+            #             context = "robot_independent"
+            #             screen_state = "robot"
 
-                    if help_start_time and time.time() - help_start_time >= 3.0:
-                        # Snap back to nearest script point (unchanged)
-                        rx, ry = env.state[IDX_RX], env.state[IDX_RY]
-                        min_dist = float("inf")
-                        best_idx = next_action_idx
-                        for i in range(len(jam_sample_actions)):
-                            ax, ay = jam_sample_actions[i][0], jam_sample_actions[i][1]
-                            d = ((ax - rx) ** 2 + (ay - ry) ** 2) ** 0.5
-                            if d < min_dist:
-                                min_dist = d
-                                best_idx = i
-                        next_action_idx = best_idx
-                        next_action = jam_sample_actions[next_action_idx]
-                        last_help_check_time = time.time()
-                        screen_state = "robot"
+            #     elif screen_state == "ready":
+            #         if env.ready_to_help():
+            #             screen_state = "help"
+            #             help_start_time = time.time()
+            #         else:
+            #             env.render(episode_num, step_id, screen_state)
+            #             time.sleep(1 / 10)
+            #             continue
 
-                    # Conformal stats (unchanged)
-                    expert_y = action
-                    y_pred = robot_prediction
-                    shi_upper_residual = expert_y - y_pred
-                    slo_lower_residual = y_pred - expert_y
-                    list_of_residuals.append(float(np.linalg.norm(np.abs(expert_y - y_pred))))
+            #     elif screen_state == "help":
+            #         action = env.get_help()
 
-                    err_hi = np.zeros(action_dim)
-                    err_lo = np.zeros(action_dim)
-                    for i in range(action_dim):
-                        if shi_upper_residual[i] > q_hi[i]:
-                            err_hi[i] = 1
-                        if slo_lower_residual[i] > q_lo[i]:
-                            err_lo[i] = 1
-                    print("err_hi", err_hi)
-                    print("err_lo", err_lo)
-                    covered = sum(err_hi) + sum(err_lo)
-                    covered = 0 if covered > 0 else 1
-                    print("covered", covered)
+            #         if help_start_time and time.time() - help_start_time >= 3.0:
+            #             # Snap back to nearest script point (unchanged)
+            #             rx, ry = env.state[IDX_RX], env.state[IDX_RY]
+            #             min_dist = float("inf")
+            #             best_idx = next_action_idx
+            #             for i in range(len(jam_sample_actions)):
+            #                 ax, ay = jam_sample_actions[i][0], jam_sample_actions[i][1]
+            #                 d = ((ax - rx) ** 2 + (ay - ry) ** 2) ** 0.5
+            #                 if d < min_dist:
+            #                     min_dist = d
+            #                     best_idx = i
+            #             next_action_idx = best_idx
+            #             next_action = jam_sample_actions[next_action_idx]
+            #             last_help_check_time = time.time()
+            #             screen_state = "robot"
 
-                    B_hi = np.ones(action_dim) * 0.01
-                    B_lo = np.ones(action_dim) * 0.01
-                    if len(history_upper_residuals) > 0:
-                        B_hi = np.max(history_upper_residuals, axis=0)
-                        B_lo = np.max(history_lower_residuals, axis=0)
+            #         # Conformal stats (unchanged)
+            #         expert_y = action
+            #         y_pred = robot_prediction
+            #         shi_upper_residual = expert_y - y_pred
+            #         slo_lower_residual = y_pred - expert_y
+            #         list_of_residuals.append(float(np.linalg.norm(np.abs(expert_y - y_pred))))
 
-                    history_upper_residuals.append(shi_upper_residual)
-                    history_lower_residuals.append(slo_lower_residual)
-                    if len(history_upper_residuals) > B_t_lookback_window:
-                        history_upper_residuals.pop(0)
-                        history_lower_residuals.pop(0)
+            #         err_hi = np.zeros(action_dim)
+            #         err_lo = np.zeros(action_dim)
+            #         for i in range(action_dim):
+            #             if shi_upper_residual[i] > q_hi[i]:
+            #                 err_hi[i] = 1
+            #             if slo_lower_residual[i] > q_lo[i]:
+            #                 err_lo[i] = 1
+            #         print("err_hi", err_hi)
+            #         print("err_lo", err_lo)
+            #         covered = sum(err_hi) + sum(err_lo)
+            #         covered = 0 if covered > 0 else 1
+            #         print("covered", covered)
 
-                    q_hi = q_hi + (stepsize) * B_hi * (err_hi - alpha_desired)
-                    q_lo = q_lo + (stepsize) * B_lo * (err_lo - alpha_desired)
+            #         B_hi = np.ones(action_dim) * 0.01
+            #         B_lo = np.ones(action_dim) * 0.01
+            #         if len(history_upper_residuals) > 0:
+            #             B_hi = np.max(history_upper_residuals, axis=0)
+            #             B_lo = np.max(history_lower_residuals, axis=0)
+
+            #         history_upper_residuals.append(shi_upper_residual)
+            #         history_lower_residuals.append(slo_lower_residual)
+            #         if len(history_upper_residuals) > B_t_lookback_window:
+            #             history_upper_residuals.pop(0)
+            #             history_lower_residuals.pop(0)
+
+            #         q_hi = q_hi + (stepsize) * B_hi * (err_hi - alpha_desired)
+            #         q_lo = q_lo + (stepsize) * B_lo * (err_lo - alpha_desired)
 
             # Book-keeping
             obs_prev2 = obs_prev1
             obs_prev1 = obs
-
+            # action = [50, 50, 0]
             if action is not None:
                 # Defensive guard that does not change your logic:
                 # skip step if NaN/Inf; otherwise clamp into action box

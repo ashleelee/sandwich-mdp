@@ -59,4 +59,5 @@ class Continuous_Policy(nn.Module):
         x = torch.relu(self.fc2(x))
         x = torch.relu(self.fc3(x))
         x = torch.relu(self.fc4(x))
+        # x = torch.sigmoid(self.fc4(x))
         return x
