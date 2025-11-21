@@ -486,10 +486,10 @@ class JamSpreadingEnv(gym.Env):
         self.draw_robot()
 
         bread_x, bread_y = int(self.state[4]), int(self.state[5])
-        pygame.draw.circle(self.screen, (255, 165, 0), (bread_x, bread_y), 25)
+        # pygame.draw.circle(self.screen, (255, 165, 0), (bread_x, bread_y), 25)
 
         end_x, end_y = int(self.state[2]), int(self.state[3])
-        pygame.draw.circle(self.screen, (255, 165, 0), (610, 140), 25) 
+        # pygame.draw.circle(self.screen, (255, 165, 0), (610, 140), 25) 
 
         # Draw current screen state text
         font = pygame.font.SysFont("Arial", 16, bold=True)
@@ -505,32 +505,6 @@ def controlled_delay(delay_time):
     start_time = pygame.time.get_ticks()
     while pygame.time.get_ticks() - start_time < delay_time:
         pygame.event.pump() 
-
-# classes for logging data
-class TimeStep:
-    def __init__(self, step_id, action, state_v, state_img_path, context, robot_prediction):
-        self.step_id = step_id
-        self.action = action
-        self.state_v = state_v
-        self.state_img = state_img_path
-        self.context = context  # "robot_independent", "robot_asked", or "human_intervened"
-        self.robot_prediction = robot_prediction
-    def to_dict(self):
-        return self.__dict__
-
-class Episode:
-    def __init__(self, episode_id):
-        self.episode_id = episode_id
-        self.steps = []
-
-    def add_step(self, step):
-        self.steps.append(step)
-
-    def to_dict(self):
-        return {
-            "episode_id": self.episode_id,
-            "steps": [step.to_dict() for step in self.steps]
-        }
 
 def create_syn_data(actions):
     import os
@@ -571,7 +545,7 @@ def main_scripted_path():
 
             if screen_state == "robot":
                 robot_prediction = next_action
-                need_help = False
+                need_help = True
                 if time.time() - last_help_check_time >= 2.0:
                     need_help = random.random() < 0.3
 
@@ -698,7 +672,7 @@ if __name__ == "__main__":
     action_dim = 3
     state_dim = 36
     cont_policy = Continuous_Policy(state_dim=state_dim, output_dim=action_dim)
-    cont_policy.load_state_dict(torch.load('cont_policy.pth'))
+    cont_policy.load_state_dict(torch.load('trained_policy/cont_policy.pth'))
     cont_policy.eval()
 
     for episode_num in range(num_episodes):
