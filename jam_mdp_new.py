@@ -19,7 +19,7 @@ VIEWPORT_H = 700
 JAM_WIDTH = 40
 DISTANCE_TO_HOLD_BAG = 50
 DISTANCE_TO_HOLD_ROBOT_ARM = 40
-UNCERTAINTY_THRESHOLD = 10
+UNCERTAINTY_THRESHOLD = 20
 
 # stats for policy
 # load normalization stats
@@ -412,7 +412,7 @@ class JamSpreadingEnv(gym.Env):
         ]
 
         # starting y slightly above your screenshot's text block
-        y_start = 430
+        y_start = 480
         line_spacing = 28
 
         for i, (text, font) in enumerate(lines):
@@ -440,7 +440,7 @@ class JamSpreadingEnv(gym.Env):
             ("to take over.",     body_font,  body_color),
         ]
 
-        y_start = 430
+        y_start = 480
         spacing = 28
 
         for i, (text, font, color) in enumerate(lines):
@@ -476,70 +476,49 @@ class JamSpreadingEnv(gym.Env):
 
         # --- Episode block ---
         label = title_font.render("Episode:", True, text_color)
-        label_rect = label.get_rect(center=(center_x, 240))
+        label_rect = label.get_rect(center=(center_x, 290))
         self.screen.blit(label, label_rect)
 
         ep_text = value_font.render(f"{episode_num}/10", True, text_color)
-        ep_rect = ep_text.get_rect(center=(center_x, 270))
+        ep_rect = ep_text.get_rect(center=(center_x, 320))
         self.screen.blit(ep_text, ep_rect)
 
         # --- Mode block ---
         mode_label = title_font.render("Mode:", True, text_color)
-        mode_label_rect = mode_label.get_rect(center=(center_x, 330))
+        mode_label_rect = mode_label.get_rect(center=(center_x, 380))
         self.screen.blit(mode_label, mode_label_rect)
 
         mode_surf = value_font.render(mode_text, True, text_color)
-        mode_rect = mode_surf.get_rect(center=(center_x, 360))
+        mode_rect = mode_surf.get_rect(center=(center_x, 410))
         self.screen.blit(mode_surf, mode_rect)
     
-    def draw_help_countdown(self, remaining_time, total_time=3.0):
-        # panel geometry
+    def draw_human_control(self):
         panel_x = 700
         panel_width = 200
         center_x = panel_x + panel_width // 2
-        center_y = 430  # adjust to taste
-        radius = 50
 
-        # colors (pick similar to your UI)
-        bg_color   = (255, 239, 200)   # light yellow
-        pie_color  = (245, 190, 90)    # darker yellow
-        text_color = (163, 74, 53)     # same as Mode text
+        text_color = (163, 74, 53)   
 
-        # background circle
-        pygame.draw.circle(self.screen, bg_color, (center_x, center_y), radius)
+        # fonts
+        title_font = pygame.font.SysFont("Arial", 18, bold=True)
+        body_font  = pygame.font.SysFont("Arial", 16)
 
-        # fraction of time remaining
-        frac = max(0.0, min(1.0, remaining_time / total_time))
+        # message lines
+        lines = [
+            ('Press "SPACE"', title_font),
+            ("to return to",  body_font),
+            ("robot control", body_font),
+        ]
 
-        # sector for remaining time
-        if frac > 0:
-            num_segments = 60
-            points = [(center_x, center_y)]
-            end_angle = 2 * math.pi * frac
+        # place this slightly below the middle of the side panel
+        y_start = 480
+        spacing = 26
 
-            for i in range(num_segments + 1):
-                theta = -math.pi / 2 + end_angle * i / num_segments  # start from top
-                x = center_x + radius * math.cos(theta)
-                y = center_y + radius * math.sin(theta)
-                points.append((x, y))
-
-            pygame.draw.polygon(self.screen, pie_color, points)
-
-        # time text (ceil to integer seconds)
-        sec = max(0, int(math.ceil(remaining_time)))
-        font = pygame.font.SysFont("Arial", 24, bold=True)
-        text_surf = font.render(f"{sec}s", True, text_color)
-        text_rect = text_surf.get_rect(center=(center_x, center_y))
-        self.screen.blit(text_surf, text_rect)
-
-        # "press space to end early"
-        small_font = pygame.font.SysFont("Arial", 16)
-        lines = ['press "space"', "to end early"]
-        y_start = center_y + radius + 20
-        for i, line in enumerate(lines):
-            surf = small_font.render(line, True, text_color)
-            rect = surf.get_rect(center=(center_x, y_start + i * 20))
+        for i, (text, font) in enumerate(lines):
+            surf = font.render(text, True, text_color)
+            rect = surf.get_rect(center=(center_x, y_start + i * spacing))
             self.screen.blit(surf, rect)
+
 
     def draw_episode_complete_text(self):
         panel_x = 700
@@ -573,7 +552,7 @@ class JamSpreadingEnv(gym.Env):
         panel_height = 700
 
         x = panel_x + (panel_width - button_width) // 2
-        y = int(panel_height * 0.65) - button_height // 2  
+        y = int(panel_height * 0.75) - button_height // 2  
         return pygame.Rect(x, y, button_width, button_height)
 
     def check_button_click(self):
@@ -596,7 +575,7 @@ class JamSpreadingEnv(gym.Env):
         graph_width = 200
         graph_height = 100
         origin_x = 700
-        origin_y = 100
+        origin_y = 130
 
         # determine scaling
         max_hist = max(hist)
@@ -631,6 +610,7 @@ class JamSpreadingEnv(gym.Env):
 
         font = pygame.font.SysFont("Arial", 16)
         font.set_bold(True)     # make the text bold
+        status_font = pygame.font.SysFont("Arial", 16, bold=True)
 
         text1 = font.render(f"uncertainty={latest_u:.2f}", True, (163, 74, 53))
         text2 = font.render(f"threshold={threshold:.1f}", True, (163, 74, 53))
@@ -641,13 +621,38 @@ class JamSpreadingEnv(gym.Env):
         panel_center_x = origin_x + graph_width / 2
 
         text1_rect.centerx = panel_center_x
-        text1_rect.y = origin_y - 60
+        text1_rect.y = origin_y - 80
 
         text2_rect.centerx = panel_center_x
-        text2_rect.y = origin_y - 40
+        text2_rect.y = origin_y - 60
 
         surface.blit(text1, text1_rect)
         surface.blit(text2, text2_rect)
+
+        # status bar 
+        bar_x = origin_x                
+        bar_y = origin_y - 24           # slightly above graph
+        bar_w = graph_width             
+        bar_h = 24                      # height of the bar
+
+        if latest_u > threshold:
+            label_text = "Robot Uncertain"
+            bg_color = (255, 210, 210)   # light red
+            fg_color = (180, 40, 40)     # red
+        else:
+            label_text = "Robot Certain"
+            bg_color = (210, 255, 210)   # light green
+            fg_color = (40, 120, 40)     # green
+
+        # draw full-width bar
+        pygame.draw.rect(surface, bg_color, (bar_x, bar_y, bar_w, bar_h))
+
+        # centered label text
+        status_font = pygame.font.SysFont("Arial", 16, bold=True)
+        label_surf = status_font.render(label_text, True, fg_color)
+        label_rect = label_surf.get_rect(center=(bar_x + bar_w // 2, bar_y + bar_h // 2))
+        surface.blit(label_surf, label_rect)
+
 
 
     def render(self, episode_num, step_id, screen="help"):
@@ -696,7 +701,7 @@ class JamSpreadingEnv(gym.Env):
         elif screen_state == "ready_intervene":
             self.draw_intervene_ready_text()
         elif screen_state == "help":
-            self.draw_help_countdown(self.help_remaining_time)
+            self.draw_human_control()
         elif screen_state == "done":
             self.draw_episode_complete_text()
         
@@ -803,10 +808,8 @@ if __name__ == "__main__":
         next_action_idx = 0
 
         # init for UI
-        help_start_time = None
         screen_state = "start" 
-        last_help_check_time = time.time()
-
+        
         # init for data logging
         episode = Episode(episode_num)
         step_id = 0
@@ -875,9 +878,7 @@ if __name__ == "__main__":
             # ---------------------------------------------------
             if screen_state == "robot":
                 
-                need_help = False
-                if time.time() - last_help_check_time >= 2.0:
-                    need_help = uncertainty_at_timestep > UNCERTAINTY_THRESHOLD
+                need_help = uncertainty_at_timestep > UNCERTAINTY_THRESHOLD
 
                 ########### human intervenes ############
                 if env.check_button_click():
@@ -902,7 +903,6 @@ if __name__ == "__main__":
             elif screen_state == "ready_intervene":
                 if env.ready_to_help():
                     screen_state = "help"
-                    help_start_time = time.time()
                 else:
                     env.render(episode_num, step_id, screen_state)
                     time.sleep(1 / 10)
@@ -911,7 +911,6 @@ if __name__ == "__main__":
             elif screen_state == "ready_help":
                 if env.ready_to_help():
                     screen_state = "help"
-                    help_start_time = time.time()
                 else:
                     env.render(episode_num, step_id, screen_state)
                     time.sleep(1 / 10)
@@ -922,22 +921,15 @@ if __name__ == "__main__":
             # Update IQT and coverage
             # ---------------------------------------------------
             elif screen_state == "help":
-
-                # elapsed and remaining time
-                elapsed = time.time() - help_start_time
-                remaining = max(0.0, 3.0 - elapsed)
-                env.help_remaining_time = remaining
-
                 # handle keyboard events in help state
-                early_exit = False
+                exit_human_control = False
                 if pygame.event.peek(pygame.KEYDOWN):
                     for event in pygame.event.get(pygame.KEYDOWN):
                         if event.key == pygame.K_SPACE:
-                            early_exit = True
+                            exit_human_control = True
 
-                # timeout or early exit
-                if remaining <= 0.0 or early_exit:
-                    last_help_check_time = time.time()
+                # if human return control back to robot
+                if exit_human_control:
                     screen_state = "robot" # return to robot control
                     continue
 
