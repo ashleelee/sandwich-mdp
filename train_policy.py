@@ -11,8 +11,10 @@ from jam_data_classes import TimeStep, Episode
 from policies.conformal.mlp import Continuous_Policy
 import matplotlib.pyplot as plt
 
+shape = "zigzag_70"
+
 # load data
-with open('data/jam_train_data_all.pkl', 'rb') as f:
+with open(f'data/jam_train_data_all_{shape}.pkl', 'rb') as f:
     all_episodes = pickle.load(f)   # list[Episode] or list[dict]
 
 
@@ -129,12 +131,12 @@ action_dim = 3
 state_dim = x_train.shape[1]   # should be 36
 cont_policy = Continuous_Policy(state_dim=state_dim, output_dim=action_dim)
 
-optimizer = optim.Adam(cont_policy.parameters(), lr=5e-4)
+optimizer = optim.Adam(cont_policy.parameters(), lr=1e-4)
 loss_fn = torch.nn.MSELoss()
 
 
 # training loop
-N_eps = 1500
+N_eps = 1000
 train_losses = []
 val_losses = []
 
@@ -148,6 +150,7 @@ for epoch in range(N_eps):
 
         optimizer.zero_grad()
         y_pred = cont_policy(x_batch)
+        # y_pred = torch.clamp(y_pred, 0.0, 1.0) #clamp to [0, 1] when computing loss
         loss = loss_fn(y_pred, y_batch)
         loss.backward()
         optimizer.step()
@@ -171,6 +174,45 @@ for epoch in range(N_eps):
     if epoch % 50 == 0:
         print(f"epoch {epoch}, train_loss {total_loss:.4f}, val_loss {total_val:.4f}")
 
+# for epoch in range(N_eps):
+#     cont_policy.train()
+#     total_loss = 0.0
+
+#     for x_batch, y_batch in train_loader:
+#         x_batch = x_batch.float()
+#         y_batch = y_batch.float()
+
+#         optimizer.zero_grad()
+#         y_pred = cont_policy(x_batch)
+#         loss = loss_fn(y_pred, y_batch)
+#         loss.backward()
+#         torch.nn.utils.clip_grad_norm_(cont_policy.parameters(), 1.0)
+#         optimizer.step()
+
+#         total_loss += loss.item()
+
+#     mean_train = total_loss / len(train_loader)
+#     train_losses.append(mean_train)
+
+#     # validation
+#     cont_policy.eval()
+#     total_val = 0.0
+#     with torch.no_grad():
+#         for x_batch, y_batch in val_loader:
+#             x_batch = x_batch.float()
+#             y_batch = y_batch.float()
+#             y_pred = cont_policy(x_batch)
+#             y_pred = torch.clamp(y_pred, 0.0, 1.0)
+#             loss = loss_fn(y_pred, y_batch)
+#             total_val += loss.item()
+
+#     mean_val = total_val / len(val_loader)
+#     val_losses.append(mean_val)
+
+#     if epoch % 50 == 0:
+#         print(f"epoch {epoch}, train_loss {mean_train:.4f}, val_loss {mean_val:.4f}")
+
+
 
 # eval on train
 cont_policy.eval()
@@ -187,10 +229,10 @@ with torch.no_grad():
 # save policy and normalization stats
 os.makedirs("trained_policy", exist_ok=True)
 
-torch.save(cont_policy.state_dict(), "trained_policy/cont_policy.pth")
+torch.save(cont_policy.state_dict(), f"trained_policy/cont_policy_{shape}.pth")
 
 np.savez(
-    "trained_policy/norm_stats.npz",
+    f"trained_policy/norm_stats_{shape}.npz",
     min_X=min_X,
     max_X=max_X,
     min_Y=min_Y,
