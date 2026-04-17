@@ -1,26 +1,3 @@
-"""
-ConformalDAgger Study Loop
-==========================
-Runs N episodes × M rounds with policy retraining between rounds.
-Total episodes collected: N × M.
-
-Usage:
-    python jam_mdp_study_merged.py
-
-You will be prompted for:
-    shape       — jam pattern used for base policy (square / triangle / zigzag / swirl)
-    N           — episodes per round
-    M           — number of rounds
-    n_orig      — number of episodes to sample from the base training data for retraining
-                  (e.g. 1.0 = equal amounts, 0.0 = study episodes only)
-
-Outputs (created automatically):
-    data/study/round_<r>.pkl                   — episodes collected in round r
-    trained_policy/study/cont_policy_round_<r>.pth
-    trained_policy/study/norm_stats_round_<r>.npz
-    jam_state_img/study/round_<r>/             — per-step screenshots
-"""
-
 import math
 import os
 import pickle
@@ -47,6 +24,11 @@ BUFFER_SIZE = 30
 N_ENSEMBLE  = 3
 UNCERTAINTY_THRESHOLD = 40
 STEP_SLEEP  = 1 / 20   # seconds between steps
+
+# DAgger method identifiers
+METHOD_CONFORMAL_ENSEMBLE = "conformal++"   # ensemble mean/std + IQT-scaled interval (current)
+METHOD_ENSEMBLE           = "ensemble"      # ensemble disagreement only, no IQT
+METHOD_CONFORMAL          = "conformal"     # single policy + IQT absolute interval
 
 # ──────────────────────────────────────────────────────────────
 # Policy helpers
@@ -107,6 +89,93 @@ def get_ensemble_prediction(obs, obs_prev1, obs_prev2, ensemble):
         for policy, min_X, range_X, min_Y, range_Y in ensemble
     ])                                  # shape: (N_ENSEMBLE, ACTION_DIM)
     return preds.mean(axis=0).astype(np.float32), preds.std(axis=0).astype(np.float32)
+
+
+# ──────────────────────────────────────────────────────────────
+# Per-method prediction + interval  (returns robot_pred, std_action,
+#                                    uncertainty, intv_lo, intv_hi)
+# ──────────────────────────────────────────────────────────────
+
+def predict_conformal_ensemble(obs, obs_prev1, obs_prev2, model, q_lo, q_hi):
+    """
+    conformal++: ensemble mean ± 2*std*q  (IQT-calibrated).
+    model : list of N_ENSEMBLE members from load_ensemble()
+    """
+    mean_action, std_action = get_ensemble_prediction(obs, obs_prev1, obs_prev2, model)
+    intv_lo    = mean_action - 2 * std_action * q_lo
+    intv_hi    = mean_action + 2 * std_action * q_hi
+    uncertainty = np.linalg.norm(2 * std_action * q_lo + 2 * std_action * q_hi)
+    return mean_action, std_action, uncertainty, intv_lo, intv_hi
+
+
+def predict_ensemble(obs, obs_prev1, obs_prev2, model, q_lo, q_hi):
+    """
+    EnsembleDAgger: fixed ±3σ interval, no IQT.
+    Uncertainty = ensemble std norm (disagreement).
+    q_lo / q_hi are ignored but kept for a uniform signature.
+    model : list of N_ENSEMBLE members from load_ensemble()
+    """
+    mean_action, std_action = get_ensemble_prediction(obs, obs_prev1, obs_prev2, model)
+    n_std       = 3.0
+    intv_lo     = mean_action - n_std * std_action
+    intv_hi     = mean_action + n_std * std_action
+    uncertainty = np.linalg.norm(std_action)
+    return mean_action, std_action, uncertainty, intv_lo, intv_hi
+
+
+def predict_conformal(obs, obs_prev1, obs_prev2, model, q_lo, q_hi):
+    """
+    Pure ConformalDAgger: single policy, interval = pred ± q  (IQT-calibrated).
+    q_lo / q_hi are absolute half-widths (not std-scaled).
+    Uncertainty = width of the interval.
+    model : 1-member list from load_ensemble() (only index 0 is used)
+    """
+    mean_action, std_action = get_ensemble_prediction(obs, obs_prev1, obs_prev2, model)
+    # std_action is 0 for a 1-member ensemble — interval comes from q alone
+    intv_lo     = mean_action - q_lo
+    intv_hi     = mean_action + q_hi
+    uncertainty = np.linalg.norm(q_lo + q_hi)
+    return mean_action, std_action, uncertainty, intv_lo, intv_hi
+
+
+# ──────────────────────────────────────────────────────────────
+# Per-method IQT residual computation  (called only in help state)
+# Returns (resid_lo, resid_hi) with negatives replaced by 1.0
+# ──────────────────────────────────────────────────────────────
+
+def iqt_residuals_scaled(expert_y, y_pred, std_action):
+    """
+    conformal++: residuals normalised by 2*std so q stays dimensionless.
+    Matches the existing formulation.
+    """
+    denom = 2 * std_action
+    denom[denom == 0] = 1.0          # avoid div-by-zero on degenerate dims
+    resid_lo = (y_pred - expert_y) / denom
+    resid_hi = (expert_y - y_pred) / denom
+    resid_lo[resid_lo < 0] = 1.0
+    resid_hi[resid_hi < 0] = 1.0
+    return resid_lo, resid_hi
+
+
+def iqt_residuals_absolute(expert_y, y_pred, std_action):
+    """
+    Pure conformal: raw absolute residuals (std_action is 0, nothing to scale by).
+    q accumulates in the same units as the action.
+    """
+    resid_lo = y_pred - expert_y
+    resid_hi = expert_y - y_pred
+    resid_lo[resid_lo < 0] = 1.0
+    resid_hi[resid_hi < 0] = 1.0
+    return resid_lo, resid_hi
+
+
+# Map method → (predict_fn, residual_fn, uses_iqt)
+# uses_iqt=False means q_lo/q_hi are never updated (ensemble method)
+METHOD_CONFIG = {
+    METHOD_CONFORMAL_ENSEMBLE: (predict_conformal_ensemble, iqt_residuals_scaled,    True),
+    METHOD_ENSEMBLE:           (predict_ensemble,           None,                    False),
+    METHOD_CONFORMAL:          (predict_conformal,          iqt_residuals_absolute,  True),
+}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -308,7 +377,7 @@ def wait_for_space(screen, lines, sub="Press SPACE to continue"):
 # Episode runner  (mirrors the main loop in jam_mdp.py)
 # ──────────────────────────────────────────────────────────────
 
-def run_round(env, N, M, round_idx, global_ep_offset, ensemble):
+def run_round(env, N, M, round_idx, global_ep_offset, ensemble, method=METHOD_CONFORMAL_ENSEMBLE):
     """
     Run N episodes and return a list of Episode objects.
 
@@ -320,7 +389,9 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble):
     round_idx        : 0-based round index (for logging)
     global_ep_offset : episode_num = global_ep_offset + local_ep
     ensemble         : list of (policy, min_X, range_X, min_Y, range_Y) from load_ensemble
+    method           : one of METHOD_CONFORMAL_ENSEMBLE / METHOD_ENSEMBLE / METHOD_CONFORMAL
     """
+    predict_fn, residual_fn, uses_iqt = METHOD_CONFIG[method]
     total_episodes = N * M
     round_episodes = []
 
@@ -377,9 +448,9 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble):
             else:
                 stuck_count = 0
 
-            # ── robot prediction (ensemble mean + std) ────
-            mean_action, std_action = get_ensemble_prediction(
-                obs, obs_prev1, obs_prev2, ensemble,
+            # ── robot prediction + interval (method-specific) ────
+            mean_action, std_action, uncertainty, intv_lo, intv_hi = predict_fn(
+                obs, obs_prev1, obs_prev2, ensemble, q_lo, q_hi,
             )
 
             # add noise if stuck
@@ -405,13 +476,6 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble):
                 np.argmin(np.abs(valid_gripper - robot_prediction[2]))
             ]
 
-            # ── uncertainty: ensemble std offset + IQT ────
-            # y_pred = robot_prediction
-            # ensemble_intv_lo = y_pred - (2 * std_action * q_lo)
-            # ensemble_intv_hi = y_pred + (2 * std_action * q_hi)
-            ensemble_intv_lo = (2 * std_action * q_lo)
-            ensemble_intv_hi = (2 * std_action * q_hi)
-            uncertainty = np.linalg.norm(ensemble_intv_lo + ensemble_intv_hi)
             uncertainty_hist.append(uncertainty)
             if len(uncertainty_hist) > 150:
                 uncertainty_hist = uncertainty_hist[-150:]
@@ -444,62 +508,40 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble):
                     env.prediction_overlay = None
                     continue
 
-                # get expert action and update IQT
+                # get expert action
                 action       = env.get_help()
                 human_action = action
                 expert_y     = action
-                y_pred    = robot_prediction
-
-                ensemble_intv_lo = y_pred - (2 * std_action * q_lo)
-                ensemble_intv_hi = y_pred + (2 * std_action * q_hi)
-                print("-------------------------------")
-                print("y pred", y_pred)
-                print("ensemble pred lo and hi", (ensemble_intv_lo, ensemble_intv_hi))
-                print("q_lo, q_hi", q_lo, q_hi)
+                y_pred       = robot_prediction
 
                 env.prediction_overlay = {
-                    "y_pred":   y_pred,
-                    "intv_lo":  ensemble_intv_lo,
-                    "intv_hi":  ensemble_intv_hi,
+                    "y_pred":  y_pred,
+                    "intv_lo": intv_lo,
+                    "intv_hi": intv_hi,
                 }
 
-                bool_miscoverage_lo = expert_y < ensemble_intv_lo
-                bool_miscoverage_hi = expert_y > ensemble_intv_hi
+                err_lo = np.any(expert_y < intv_lo)
+                err_hi = np.any(expert_y > intv_hi)
+                print(f"  [IQT] err_lo={err_lo}  err_hi={err_hi}  q_lo={q_lo}  q_hi={q_hi}")
 
-                # import pdb; pdb.set_trace()
+                if uses_iqt:
+                    resid_lo, resid_hi = residual_fn(expert_y, y_pred, std_action)
 
-                # check if there is a miscoverage in any of the 3 dim
-                err_lo = np.any(bool_miscoverage_lo)
-                err_hi = np.any(bool_miscoverage_hi)
-                print("err_lo, err_hi:", err_lo, err_hi)
+                    B_hi = np.ones(ACTION_DIM) * 0.01
+                    B_lo = np.ones(ACTION_DIM) * 0.01
 
-                resid_lo = (y_pred - expert_y)/(2*std_action)
-                resid_hi = (expert_y - y_pred)/(2*std_action)
-                
-                # replace negatives in resid_lo and reside_hi with 1.0
-                resid_lo[resid_lo < 0] = 1.0
-                resid_hi[resid_hi < 0] = 1.0
+                    if len(history_upper) > 0:
+                        B_hi = np.max(history_upper, axis=0)
+                        B_lo = np.max(history_lower, axis=0)
 
-                B_hi = np.ones(ACTION_DIM) * 0.01
-                B_lo = np.ones(ACTION_DIM) * 0.01
+                    history_upper.append(resid_hi)
+                    history_lower.append(resid_lo)
+                    if len(history_upper) > B_t_lookback:
+                        history_upper.pop(0)
+                        history_lower.pop(0)
 
-                if len(history_upper) > 0:
-                    B_hi = np.max(history_upper, axis=0)
-                    B_lo = np.max(history_lower, axis=0)
-
-                history_upper.append(resid_hi)
-                history_lower.append(resid_lo)
-                if len(history_upper) > B_t_lookback:
-                    history_upper.pop(0)
-                    history_lower.pop(0)
-
-                # IQT update 
-                q_hi = q_hi + stepsize * B_hi * (err_hi - alpha_desired)
-                q_lo = q_lo + stepsize * B_lo * (err_lo - alpha_desired)
-
-                # IQT update (clamp to small positive floor)
-                # q_hi = np.maximum(q_hi + stepsize * B_hi * (err_hi - alpha_desired), 0.01)
-                # q_lo = np.maximum(q_lo + stepsize * B_lo * (err_lo - alpha_desired), 0.01)
+                    q_hi = q_hi + stepsize * B_hi * (err_hi - alpha_desired)
+                    q_lo = q_lo + stepsize * B_lo * (err_lo - alpha_desired)
 
             # ── step environment ──────────────────────────
             # ── log ───────────────────────────────────────
@@ -530,8 +572,8 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble):
                     q_lo=q_lo.copy(),
                     q_hi=q_hi.copy(),
                     std_action=std_action.copy(),
-                    intv_lo=(robot_prediction - 2 * std_action * q_lo).copy(),
-                    intv_hi=(robot_prediction + 2 * std_action * q_hi).copy(),
+                    intv_lo=intv_lo.copy(),
+                    intv_hi=intv_hi.copy(),
                 ))
                 if done:
                     screen_state = "done"
@@ -754,29 +796,31 @@ def run_rollout(env, n_rollout, ensemble):
 def run_study():
     # ── user inputs ───────────────────────────────
     shape_map  = {"1": "square", "2": "triangle", "3": "zigzag", "4": "swirl"}
+    method_map = {"1": METHOD_CONFORMAL_ENSEMBLE, "2": METHOD_CONFORMAL, "3": METHOD_ENSEMBLE}
     shape        = shape_map[input("Shape  1=square  2=triangle  3=zigzag  4=swirl: ").strip()]
+    method       = method_map[input("Method  1=conformal++  2=conformal  3=ensemble:").strip()]
     N            = int(input("Episodes per round (N): "))
     M            = int(input("Number of rounds (M): "))
     N_EXPERT     = int(input("Expert reference episodes to collect before study (N_expert): "))
     show_rollout = input("Show final rollout after study? (y/n): ").strip().lower() == "y"
 
     # ── paths ─────────────────────────────────────
-    base_data_file  = f"data/jam_train_data_all_{shape}.pkl"
     study_model_dir = "trained_policy/study"
-    # initial ensemble: N_ENSEMBLE pre-trained models (each with its own norm stats)
+    # conformal uses a single policy; conformal++ and ensemble use a full ensemble
+    n_init_members = 1 if method == METHOD_CONFORMAL else N_ENSEMBLE
     init_policy_paths = [
         f"trained_policy/ensemble/cont_policy_{shape}20hz_{i+1}.pth"
-        for i in range(N_ENSEMBLE)
+        for i in range(n_init_members)
     ]
     init_stats_paths = [
         f"trained_policy/ensemble/norm_stats_{shape}20hz_{i+1}.npz"
-        for i in range(N_ENSEMBLE)
+        for i in range(n_init_members)
     ]
 
     os.makedirs("data/study",    exist_ok=True)
     os.makedirs(study_model_dir, exist_ok=True)
 
-    print(f"\nStudy config: shape={shape}  N={N}  M={M}  buffer_size={BUFFER_SIZE}")
+    print(f"\nStudy config: shape={shape}  method={method}  N={N}  M={M}  buffer_size={BUFFER_SIZE}")
     print(f"Total episodes: {N * M}  ({M} rounds × {N} episodes)\n")
 
     # ── pygame + env ──────────────────────────────
@@ -794,9 +838,9 @@ def run_study():
     episode_buffer = [base_episodes[i] for i in idxs[:BUFFER_SIZE]]
     print(f"  Buffer initialized with {len(episode_buffer)} base episodes (BUFFER_SIZE={BUFFER_SIZE})")
 
-    # load initial ensemble
+    # load initial model(s)
     ensemble = load_ensemble(init_policy_paths, init_stats_paths)
-    print(f"  Loaded initial ensemble ({N_ENSEMBLE} members)")
+    print(f"  Loaded initial model ({n_init_members} member(s), method={method})")
 
     # ── collect expert reference episodes (once, before any rounds) ────
     expert_ref_path = "data/study/expert_reference.pkl"
@@ -809,7 +853,7 @@ def run_study():
         env.img_save_dir = f"study/round_{round_idx}"
 
         print(f"\n{'='*55}")
-        print(f"  ROUND {round_idx + 1} / {M}  —  {N} episodes  ({N_ENSEMBLE}-member ensemble)")
+        print(f"  ROUND {round_idx + 1} / {M}  —  {N} episodes  (method={method})")
         print(f"{'='*55}")
 
         # wait for experimenter to press SPACE before each round
@@ -823,6 +867,7 @@ def run_study():
             env, N, M, round_idx,
             global_ep_offset=round_idx * N,
             ensemble=ensemble,
+            method=method,
         )
         # save this round's raw data
         round_data_path = f"data/study/round_{round_idx}.pkl"
@@ -848,7 +893,8 @@ def run_study():
             output_dir=study_model_dir,
         )
         # all retrained members share the same norm stats
-        ensemble = load_ensemble(new_policy_paths, [new_stats_path] * N_ENSEMBLE)
+        n_members = 1 if method == METHOD_CONFORMAL else N_ENSEMBLE
+        ensemble = load_ensemble(new_policy_paths[:n_members], [new_stats_path] * n_members)
         pygame.event.clear()   # flush events queued during retraining (no pump was called)
 
     # ── study complete ────────────────────────────
