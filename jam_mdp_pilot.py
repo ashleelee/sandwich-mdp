@@ -25,13 +25,15 @@ N_ENSEMBLE  = 3
 UNCERTAINTY_THRESHOLD_ENSEMBLE  = 6.73
 UNCERTAINTY_THRESHOLD_CONFORMAL = 56.4255
 UNCERTAINTY_THRESHOLD_CONFORMAL_ENSEMBLE = 40
+UNCERTAINTY_THRESHOLD_ENSEMBLE_CLASSIFIER = 1.0   # normalized composite: >1.0 → need help
 STEP_SLEEP  = 1 / 20   # seconds between steps
 
 # DAgger method identifiers
-METHOD_CONFORMAL_ENSEMBLE = "conformal++"   # ensemble mean/std + IQT-scaled interval (current)
-METHOD_ENSEMBLE           = "ensemble"      # ensemble disagreement only, no IQT
-METHOD_CONFORMAL          = "conformal"     # single policy + IQT absolute interval
-METHOD_LAZYDAGGER         = "lazydagger"    # single policy + binary safety classifier
+METHOD_CONFORMAL_ENSEMBLE    = "conformal++"   # ensemble mean/std + IQT-scaled interval (current)
+METHOD_ENSEMBLE              = "ensemble"      # ensemble disagreement only, no IQT
+METHOD_CONFORMAL             = "conformal"     # single policy + IQT absolute interval
+METHOD_LAZYDAGGER            = "lazydagger"    # single policy + binary safety classifier
+METHOD_ENSEMBLE_CLASSIFIER   = "ensemble_clf"  # N_ENSEMBLE policies + safety classifier; auto exit
 
 # LazyDAgger thresholds
 LAZYDAGGER_BETA_H      = 56.4255 # action-loss boundary for classifier labels (train: loss>β_H → unsafe)
@@ -173,6 +175,42 @@ def predict_lazydagger(obs, obs_prev1, obs_prev2, model, q_lo, q_hi):
     return mean_action, std_action, uncertainty, None, None
 
 
+def predict_ensemble_clf(obs, obs_prev1, obs_prev2, model, q_lo, q_hi):
+    """
+    EnsembleDAgger + SafetyClassifier:
+    - Ensemble mean/std for action; classifier for unsafe detection.
+    - uncertainty = max(ensemble_std_norm / ENSEMBLE_THRESHOLD, prob_unsafe / 0.5)
+      → > 1.0 triggers human help (either signal exceeds its own threshold).
+      → < 1.0 in help mode automatically returns control to the robot.
+    model : (policy_list, (clf_net, clf_min_X, clf_range_X))
+    q_lo / q_hi are unused but kept for uniform signature.
+    """
+    policy_list, (clf_net, clf_min_X, clf_range_X) = model
+    mean_action, std_action = get_ensemble_prediction(obs, obs_prev1, obs_prev2, policy_list)
+
+    ensemble_unc = np.linalg.norm(std_action)
+
+    input_obs = np.concatenate(
+        [np.array(obs_prev2, dtype=np.float32),
+         np.array(obs_prev1, dtype=np.float32),
+         np.array(obs,       dtype=np.float32)],
+        axis=0,
+    )
+    x_norm = (input_obs - clf_min_X) / clf_range_X
+    with torch.no_grad():
+        probs = clf_net(torch.tensor(x_norm, dtype=torch.float32).unsqueeze(0))
+        prob_unsafe = probs[0, 1].item()
+
+    # normalized composite: > 1.0 iff either signal exceeds its threshold
+    uncertainty = max(ensemble_unc / UNCERTAINTY_THRESHOLD_ENSEMBLE, prob_unsafe / 0.5)
+
+    n_std = 3.0
+    intv_lo = mean_action - n_std * std_action
+    intv_hi = mean_action + n_std * std_action
+
+    return mean_action, std_action, uncertainty, intv_lo, intv_hi
+
+
 # ──────────────────────────────────────────────────────────────
 # Per-method IQT residual computation  (called only in help state)
 # Returns (resid_lo, resid_hi) with negatives replaced by 1.0
@@ -208,10 +246,11 @@ def iqt_residuals_absolute(expert_y, y_pred, std_action):
 # uses_iqt=False  → q_lo/q_hi are never updated
 # unc_threshold   → need_help = uncertainty > unc_threshold
 METHOD_CONFIG = {
-    METHOD_CONFORMAL_ENSEMBLE: (predict_conformal_ensemble, iqt_residuals_scaled,    True,  UNCERTAINTY_THRESHOLD_CONFORMAL_ENSEMBLE),
-    METHOD_ENSEMBLE:           (predict_ensemble,           None,                    False, UNCERTAINTY_THRESHOLD_ENSEMBLE),
-    METHOD_CONFORMAL:          (predict_conformal,          iqt_residuals_absolute,  True,  UNCERTAINTY_THRESHOLD_CONFORMAL),
-    METHOD_LAZYDAGGER:         (predict_lazydagger,         None,                    False, 0.5),
+    METHOD_CONFORMAL_ENSEMBLE:  (predict_conformal_ensemble, iqt_residuals_scaled,    True,  UNCERTAINTY_THRESHOLD_CONFORMAL_ENSEMBLE),
+    METHOD_ENSEMBLE:            (predict_ensemble,           None,                    False, UNCERTAINTY_THRESHOLD_ENSEMBLE),
+    METHOD_CONFORMAL:           (predict_conformal,          iqt_residuals_absolute,  True,  UNCERTAINTY_THRESHOLD_CONFORMAL),
+    METHOD_LAZYDAGGER:          (predict_lazydagger,         None,                    False, 0.5),
+    METHOD_ENSEMBLE_CLASSIFIER: (predict_ensemble_clf,       None,                    False, UNCERTAINTY_THRESHOLD_ENSEMBLE_CLASSIFIER),
 }
 
 
@@ -530,7 +569,8 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble, method=METHOD_CO
     method           : one of METHOD_CONFORMAL_ENSEMBLE / METHOD_ENSEMBLE / METHOD_CONFORMAL
     """
     predict_fn, residual_fn, uses_iqt, unc_threshold = METHOD_CONFIG[method]
-    env.unc_threshold = unc_threshold
+    env.unc_threshold  = unc_threshold
+    env.can_intervene  = method not in (METHOD_ENSEMBLE, METHOD_LAZYDAGGER, METHOD_ENSEMBLE_CLASSIFIER)
     total_episodes = N * M
     round_episodes = []
 
@@ -625,7 +665,7 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble, method=METHOD_CO
 
             if screen_state == "robot":
                 need_help = uncertainty > unc_threshold
-                can_intervene = method not in (METHOD_ENSEMBLE, METHOD_LAZYDAGGER)
+                can_intervene = method not in (METHOD_ENSEMBLE, METHOD_LAZYDAGGER, METHOD_ENSEMBLE_CLASSIFIER)
                 if can_intervene and env.check_button_click():
                     screen_state = "ready_intervene"
                     context = "human_intervened"
@@ -651,6 +691,20 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble, method=METHOD_CO
                         action    = action.copy()
                         action[0] = np.clip(action[0] + noise_xy[0], 0.0, 700.0)
                         action[1] = np.clip(action[1] + noise_xy[1], 0.0, 700.0)
+
+                elif method == METHOD_ENSEMBLE_CLASSIFIER:
+                    # In human mode: exit when BOTH
+                    #   (1) ‖robot_pred − human‖ < 56.4255  (action distance safe)
+                    #   (2) ensemble std norm < 6.73          (ensemble not too uncertain)
+                    action       = env.get_help()
+                    human_action = action
+
+                    if action is not None:
+                        dist         = float(np.linalg.norm(robot_prediction - action))
+                        ensemble_unc = np.linalg.norm(std_action)
+                        if dist < LAZYDAGGER_BETA_H and ensemble_unc < UNCERTAINTY_THRESHOLD_ENSEMBLE:
+                            screen_state = "robot"
+                            env.prediction_overlay = None
 
                 else:
                     # SPACE key exits help mode
@@ -956,13 +1010,12 @@ def run_study():
         "2": METHOD_CONFORMAL,
         "3": METHOD_ENSEMBLE,
         "4": METHOD_LAZYDAGGER,
+        "5": METHOD_ENSEMBLE_CLASSIFIER,
     }
     shape        = shape_map[input("Shape  1=square  2=triangle  3=zigzag  4=swirl: ").strip()]
-    method       = method_map[input("Method  1=conformal++  2=conformal  3=ensemble  4=lazydagger: ").strip()]
+    method       = method_map[input("Method  1=conformal++  2=conformal  3=ensemble  4=lazydagger  5=ensemble_clf: ").strip()]
     N            = int(input("Episodes per round (N): "))
     M            = int(input("Number of rounds (M): "))
-    N_EXPERT     = int(input("Expert reference episodes to collect before study (N_expert): "))
-    show_rollout = input("Show final rollout after study? (y/n): ").strip().lower() == "y"
 
     # ── paths ─────────────────────────────────────
     study_model_dir = "trained_policy/study"
@@ -1000,7 +1053,7 @@ def run_study():
 
     # load initial model(s)
     policy_list = load_ensemble(init_policy_paths, init_stats_paths)
-    if method == METHOD_LAZYDAGGER:
+    if method in (METHOD_LAZYDAGGER, METHOD_ENSEMBLE_CLASSIFIER):
         clf_init_path   = "trained_safety_classifier/safety_classifier.pth"
         clf_init_stats  = "trained_safety_classifier/norm_stats_safety_classifier.npz"
         ensemble = (policy_list, load_lazydagger_classifier(clf_init_path, clf_init_stats))
@@ -1008,10 +1061,6 @@ def run_study():
     else:
         ensemble = policy_list
     print(f"  Loaded initial model ({n_init_members} member(s), method={method})")
-
-    # ── collect expert reference episodes (once, before any rounds) ────
-    expert_ref_path = "data/study/expert_reference.pkl"
-    expert_episodes = collect_expert_episodes(env, N_EXPERT, expert_ref_path)
 
     for round_idx in range(M):
         # per-round image directory
@@ -1062,7 +1111,7 @@ def run_study():
             n_members=n_members,
         )
         policy_list = load_ensemble(new_policy_paths[:n_members], [new_stats_path] * n_members)
-        if method == METHOD_LAZYDAGGER:
+        if method in (METHOD_LAZYDAGGER, METHOD_ENSEMBLE_CLASSIFIER):
             clf_path = train_lazydagger_classifier(episode_buffer, study_model_dir, round_idx, new_stats_path)
             ensemble = (policy_list, load_lazydagger_classifier(clf_path, new_stats_path))
         else:
@@ -1072,13 +1121,12 @@ def run_study():
     # ── study complete ────────────────────────────
     print(f"\nStudy complete: {N * M} total episodes across {M} rounds.")
 
-    if show_rollout:
-        wait_for_space(
-            env.screen,
-            ["Study complete!", "Final rollout coming up…"],
-            sub="Press SPACE to begin rollout",
-        )
-        run_rollout(env, 1, ensemble=ensemble)
+    wait_for_space(
+        env.screen,
+        ["Study complete!", "Final rollout coming up…"],
+        sub="Press SPACE to begin rollout",
+    )
+    run_rollout(env, 1, ensemble=ensemble)
 
     wait_for_space(
         env.screen,
