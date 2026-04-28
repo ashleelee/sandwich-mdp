@@ -16,19 +16,27 @@ from jam_mdp import (
     controlled_delay,
     similar_state,
 )
-from policies.conformal.mlp import Continuous_Policy
+from policies.conformal.mlp import Continuous_Policy, SafetyClassifier
 
 ACTION_DIM  = 3
 STATE_DIM   = 36
 BUFFER_SIZE = 30
 N_ENSEMBLE  = 3
-UNCERTAINTY_THRESHOLD = 40
+UNCERTAINTY_THRESHOLD_ENSEMBLE  = 6.73
+UNCERTAINTY_THRESHOLD_CONFORMAL = 56.4255
+UNCERTAINTY_THRESHOLD_CONFORMAL_ENSEMBLE = 40
 STEP_SLEEP  = 1 / 20   # seconds between steps
 
 # DAgger method identifiers
 METHOD_CONFORMAL_ENSEMBLE = "conformal++"   # ensemble mean/std + IQT-scaled interval (current)
 METHOD_ENSEMBLE           = "ensemble"      # ensemble disagreement only, no IQT
 METHOD_CONFORMAL          = "conformal"     # single policy + IQT absolute interval
+METHOD_LAZYDAGGER         = "lazydagger"    # single policy + binary safety classifier
+
+# LazyDAgger thresholds
+LAZYDAGGER_BETA_H      = 56.4255 # action-loss boundary for classifier labels (train: loss>β_H → unsafe)
+LAZYDAGGER_BETA_R      = LAZYDAGGER_BETA_H * 1/10   # true loss below which supervisor releases control
+LAZYDAGGER_NOISE_SIGMA = 3.0    # σ of Gaussian noise added to supervisor actions
 
 # ──────────────────────────────────────────────────────────────
 # Policy helpers
@@ -91,6 +99,7 @@ def get_ensemble_prediction(obs, obs_prev1, obs_prev2, ensemble):
     return preds.mean(axis=0).astype(np.float32), preds.std(axis=0).astype(np.float32)
 
 
+
 # ──────────────────────────────────────────────────────────────
 # Per-method prediction + interval  (returns robot_pred, std_action,
 #                                    uncertainty, intv_lo, intv_hi)
@@ -138,6 +147,32 @@ def predict_conformal(obs, obs_prev1, obs_prev2, model, q_lo, q_hi):
     return mean_action, std_action, uncertainty, intv_lo, intv_hi
 
 
+def predict_lazydagger(obs, obs_prev1, obs_prev2, model, q_lo, q_hi):
+    """
+    LazyDAgger: single policy + binary safety classifier.
+    model : (policy_list_1member, (clf_net, min_X, range_X))
+    uncertainty = P(need_help | state) in [0, 1]; threshold in METHOD_CONFIG = 0.5
+    q_lo / q_hi are unused but kept for uniform signature.
+    """
+    policy_list, (clf_net, clf_min_X, clf_range_X) = model
+    mean_action, std_action = get_ensemble_prediction(obs, obs_prev1, obs_prev2, policy_list)
+
+    input_obs = np.concatenate(
+        [np.array(obs_prev2, dtype=np.float32),
+         np.array(obs_prev1, dtype=np.float32),
+         np.array(obs,       dtype=np.float32)],
+        axis=0,
+    )
+    x_norm = (input_obs - clf_min_X) / clf_range_X
+    with torch.no_grad():
+        probs = clf_net(torch.tensor(x_norm, dtype=torch.float32).unsqueeze(0))
+        prob_unsafe = probs[0, 1].item()  # index 1 = P(unsafe)
+
+    uncertainty = prob_unsafe
+    print("prob_unsafe:", prob_unsafe )
+    return mean_action, std_action, uncertainty, None, None
+
+
 # ──────────────────────────────────────────────────────────────
 # Per-method IQT residual computation  (called only in help state)
 # Returns (resid_lo, resid_hi) with negatives replaced by 1.0
@@ -169,12 +204,14 @@ def iqt_residuals_absolute(expert_y, y_pred, std_action):
     return resid_lo, resid_hi
 
 
-# Map method → (predict_fn, residual_fn, uses_iqt)
-# uses_iqt=False means q_lo/q_hi are never updated (ensemble method)
+# Map method → (predict_fn, residual_fn, uses_iqt, unc_threshold)
+# uses_iqt=False  → q_lo/q_hi are never updated
+# unc_threshold   → need_help = uncertainty > unc_threshold
 METHOD_CONFIG = {
-    METHOD_CONFORMAL_ENSEMBLE: (predict_conformal_ensemble, iqt_residuals_scaled,    True),
-    METHOD_ENSEMBLE:           (predict_ensemble,           None,                    False),
-    METHOD_CONFORMAL:          (predict_conformal,          iqt_residuals_absolute,  True),
+    METHOD_CONFORMAL_ENSEMBLE: (predict_conformal_ensemble, iqt_residuals_scaled,    True,  UNCERTAINTY_THRESHOLD_CONFORMAL_ENSEMBLE),
+    METHOD_ENSEMBLE:           (predict_ensemble,           None,                    False, UNCERTAINTY_THRESHOLD_ENSEMBLE),
+    METHOD_CONFORMAL:          (predict_conformal,          iqt_residuals_absolute,  True,  UNCERTAINTY_THRESHOLD_CONFORMAL),
+    METHOD_LAZYDAGGER:         (predict_lazydagger,         None,                    False, 0.5),
 }
 
 
@@ -257,19 +294,19 @@ def _build_dataset(episodes, human_only=False):
     return np.array(all_X, dtype=np.float32), np.array(all_Y, dtype=np.float32)
 
 
-def retrain_policy(episode_buffer, round_idx, output_dir):
+def retrain_policy(episode_buffer, round_idx, output_dir, n_members=N_ENSEMBLE):
     """
-    Train N_ENSEMBLE independent policies on the current episode buffer.
+    Train n_members independent policies on the current episode buffer.
     All members share the same normalisation stats (same dataset).
 
     Returns
     -------
-    policy_paths : list of N_ENSEMBLE .pth paths
+    policy_paths : list of n_members .pth paths
     stats_path   : single .npz path (shared norm stats)
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"  [retrain] Training {N_ENSEMBLE} ensemble members on {len(episode_buffer)} buffered episodes")
+    print(f"  [retrain] Training {n_members} member(s) on {len(episode_buffer)} buffered episodes")
 
     all_X, all_Y = _build_dataset(episode_buffer, human_only=False)
     print(f"  [retrain] Dataset: {all_X.shape[0]} steps total")
@@ -289,7 +326,7 @@ def retrain_policy(episode_buffer, round_idx, output_dir):
     loss_fn = torch.nn.MSELoss()
     policy_paths = []
 
-    for member_idx in range(N_ENSEMBLE):
+    for member_idx in range(n_members):
         print(f"  [retrain] Member {member_idx + 1}/{N_ENSEMBLE}")
 
         # Each member gets its own shuffle → different train/val split
@@ -333,6 +370,107 @@ def retrain_policy(episode_buffer, round_idx, output_dir):
         print(f"  [retrain] Saved → {policy_path}")
 
     return policy_paths, stats_path
+
+
+# ──────────────────────────────────────────────────────────────
+# LazyDAgger classifier helpers
+# ──────────────────────────────────────────────────────────────
+
+def train_lazydagger_classifier(episode_buffer, output_dir, round_idx, stats_path):
+    """
+    Retrain SafetyClassifier by combining:
+      - all original labeled data from data/train_safety/classifier/safety_dataset.pkl
+      - new steps from episode_buffer where the human intervened (robot_asked / human_intervened)
+    Label convention: 0=safe, 1=unsafe  (||robot_pred - action|| > LAZYDAGGER_BETA_H → unsafe)
+    Returns clf_path.
+    """
+    stats   = np.load(stats_path)
+    min_X   = stats["min_X"]
+    max_X   = stats["max_X"]
+    range_X = max_X - min_X
+    range_X[range_X == 0] = 1.0
+
+    # ── original safety dataset (raw, unnormalized) ────────────
+    orig_path = "data/train_safety/classifier/safety_dataset.pkl"
+    with open(orig_path, "rb") as f:
+        orig = pickle.load(f)
+    all_X      = list(orig["X"])       # list of (36,) arrays, unnormalized
+    all_labels = list(orig["labels"])  # 0=safe, 1=unsafe
+    print(f"  [lazydagger_clf] Loaded {len(all_X)} original samples from {orig_path}")
+
+    # ── new human-intervention steps from episode buffer ───────
+    n_new = 0
+    for ep in episode_buffer:
+        steps = ep.steps if hasattr(ep, "steps") else ep["steps"]
+        if len(steps) < 4:
+            continue
+        for t in range(len(steps) - 3):
+            def _s(s):  return np.array(s.state  if hasattr(s, "state")  else s["state"],  dtype=np.float32)
+            def _a(s):  return np.array(s.action if hasattr(s, "action") else s["action"], dtype=np.float32)
+            def _rp(s):
+                rp = s.robot_prediction if hasattr(s, "robot_prediction") else s.get("robot_prediction")
+                return np.array(rp, dtype=np.float32) if rp is not None else None
+            def _ctx(s): return s.context if hasattr(s, "context") else s.get("context", "")
+
+            if _ctx(steps[t + 3]) not in ("robot_asked", "human_intervened"):
+                continue
+            robot_pred = _rp(steps[t + 3])
+            if robot_pred is None:
+                continue
+
+            state_input = np.concatenate([_s(steps[t]), _s(steps[t + 1]), _s(steps[t + 2])], axis=0)
+            loss        = np.linalg.norm(robot_pred - _a(steps[t + 3]))
+            all_X.append(state_input)
+            all_labels.append(1 if loss > LAZYDAGGER_BETA_H else 0)
+            n_new += 1
+    print(f"  [lazydagger_clf] Added {n_new} new human-intervention samples")
+
+    X = np.array(all_X,      dtype=np.float32)
+    Y = np.array(all_labels, dtype=np.int64)
+
+    # normalize all data with current round's stats
+    X_norm   = (X - min_X) / range_X
+    n_unsafe = int((Y == 1).sum())
+    n_safe   = int((Y == 0).sum())
+    print(f"  [lazydagger_clf] Total: {len(X)} samples  (unsafe={n_unsafe}  safe={n_safe})")
+
+    clf_path = os.path.join(output_dir, f"lazydagger_clf_round_{round_idx}.pth")
+    clf      = SafetyClassifier(input_dim=STATE_DIM)
+
+    loader    = DataLoader(TensorDataset(torch.tensor(X_norm), torch.tensor(Y)), batch_size=256, shuffle=True)
+    optimizer = optim.Adam(clf.parameters(), lr=1e-4)
+    ce        = torch.nn.CrossEntropyLoss()
+
+    for epoch in range(1000):
+        clf.train()
+        for xb, yb in loader:
+            optimizer.zero_grad()
+            ce(clf(xb.float()), yb).backward()
+            optimizer.step()
+        if epoch % 50 == 0:
+            clf.eval()
+            with torch.no_grad():
+                preds = clf(torch.tensor(X_norm)).argmax(dim=1).numpy()
+            acc = (preds == Y).mean()
+            print(f"    epoch {epoch:3d}  acc={acc:.3f}")
+
+    torch.save(clf.state_dict(), clf_path)
+    print(f"  [lazydagger_clf] Saved → {clf_path}")
+    return clf_path
+
+
+def load_lazydagger_classifier(clf_path, stats_path):
+    """Load BinaryClassifier; returns (clf_net, min_X, range_X) tuple."""
+    stats   = np.load(stats_path)
+    min_X   = stats["min_X"]
+    max_X   = stats["max_X"]
+    range_X = max_X - min_X
+    range_X[range_X == 0] = 1.0
+
+    clf = SafetyClassifier(input_dim=STATE_DIM)
+    clf.load_state_dict(torch.load(clf_path))
+    clf.eval()
+    return (clf, min_X, range_X)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -391,7 +529,8 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble, method=METHOD_CO
     ensemble         : list of (policy, min_X, range_X, min_Y, range_Y) from load_ensemble
     method           : one of METHOD_CONFORMAL_ENSEMBLE / METHOD_ENSEMBLE / METHOD_CONFORMAL
     """
-    predict_fn, residual_fn, uses_iqt = METHOD_CONFIG[method]
+    predict_fn, residual_fn, uses_iqt, unc_threshold = METHOD_CONFIG[method]
+    env.unc_threshold = unc_threshold
     total_episodes = N * M
     round_episodes = []
 
@@ -485,8 +624,9 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble, method=METHOD_CO
             human_action = None  # set below if human is controlling
 
             if screen_state == "robot":
-                need_help = uncertainty > UNCERTAINTY_THRESHOLD
-                if env.check_button_click():
+                need_help = uncertainty > unc_threshold
+                can_intervene = method not in (METHOD_ENSEMBLE, METHOD_LAZYDAGGER)
+                if can_intervene and env.check_button_click():
                     screen_state = "ready_intervene"
                     context = "human_intervened"
                 elif need_help:
@@ -497,51 +637,66 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble, method=METHOD_CO
                     context = "robot_independent"
 
             elif screen_state == "help":
-                # check if human hands back control
-                exit_human = False
-                if pygame.event.peek(pygame.KEYDOWN):
-                    for event in pygame.event.get(pygame.KEYDOWN):
-                        if event.key == pygame.K_SPACE:
-                            exit_human = True
-                if exit_human:
-                    screen_state = "robot"
-                    env.prediction_overlay = None
-                    continue
+                if method == METHOD_LAZYDAGGER:
+                    # Exit when true action loss drops below β_R; noisy supervisor execution
+                    action       = env.get_help()
+                    human_action = action
 
-                # get expert action
-                action       = env.get_help()
-                human_action = action
-                expert_y     = action
-                y_pred       = robot_prediction
+                    if action is not None:
+                        true_loss = float(np.linalg.norm(robot_prediction - action))
+                        if true_loss < LAZYDAGGER_BETA_R:
+                            screen_state = "robot"
+                            env.prediction_overlay = None
+                        noise_xy  = np.random.normal(0.0, LAZYDAGGER_NOISE_SIGMA, 2)
+                        action    = action.copy()
+                        action[0] = np.clip(action[0] + noise_xy[0], 0.0, 700.0)
+                        action[1] = np.clip(action[1] + noise_xy[1], 0.0, 700.0)
 
-                env.prediction_overlay = {
-                    "y_pred":  y_pred,
-                    "intv_lo": intv_lo,
-                    "intv_hi": intv_hi,
-                }
+                else:
+                    # SPACE key exits help mode
+                    exit_human = False
+                    if pygame.event.peek(pygame.KEYDOWN):
+                        for event in pygame.event.get(pygame.KEYDOWN):
+                            if event.key == pygame.K_SPACE:
+                                exit_human = True
+                    if exit_human:
+                        screen_state = "robot"
+                        env.prediction_overlay = None
+                        continue
 
-                err_lo = np.any(expert_y < intv_lo)
-                err_hi = np.any(expert_y > intv_hi)
-                print(f"  [IQT] err_lo={err_lo}  err_hi={err_hi}  q_lo={q_lo}  q_hi={q_hi}")
+                    action       = env.get_help()
+                    human_action = action
+                    expert_y     = action
+                    y_pred       = robot_prediction
 
-                if uses_iqt:
-                    resid_lo, resid_hi = residual_fn(expert_y, y_pred, std_action)
+                    env.prediction_overlay = {
+                        "y_pred":  y_pred,
+                        "intv_lo": intv_lo,
+                        "intv_hi": intv_hi,
+                    }
 
-                    B_hi = np.ones(ACTION_DIM) * 0.01
-                    B_lo = np.ones(ACTION_DIM) * 0.01
+                    err_lo = np.any(expert_y < intv_lo)
+                    err_hi = np.any(expert_y > intv_hi)
+                    print(f"  [IQT] err_lo={err_lo}  err_hi={err_hi}  q_lo={q_lo}  q_hi={q_hi}")
 
-                    if len(history_upper) > 0:
-                        B_hi = np.max(history_upper, axis=0)
-                        B_lo = np.max(history_lower, axis=0)
+                    if uses_iqt:
+                        resid_lo, resid_hi = residual_fn(expert_y, y_pred, std_action)
 
-                    history_upper.append(resid_hi)
-                    history_lower.append(resid_lo)
-                    if len(history_upper) > B_t_lookback:
-                        history_upper.pop(0)
-                        history_lower.pop(0)
+                        B_hi = np.ones(ACTION_DIM) * 0.01
+                        B_lo = np.ones(ACTION_DIM) * 0.01
 
-                    q_hi = q_hi + stepsize * B_hi * (err_hi - alpha_desired)
-                    q_lo = q_lo + stepsize * B_lo * (err_lo - alpha_desired)
+                        if len(history_upper) > 0:
+                            B_hi = np.max(history_upper, axis=0)
+                            B_lo = np.max(history_lower, axis=0)
+
+                        history_upper.append(resid_hi)
+                        history_lower.append(resid_lo)
+                        if len(history_upper) > B_t_lookback:
+                            history_upper.pop(0)
+                            history_lower.pop(0)
+
+                        q_hi = q_hi + stepsize * B_hi * (err_hi - alpha_desired)
+                        q_lo = q_lo + stepsize * B_lo * (err_lo - alpha_desired)
 
             # ── step environment ──────────────────────────
             # ── log ───────────────────────────────────────
@@ -572,8 +727,8 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble, method=METHOD_CO
                     q_lo=q_lo.copy(),
                     q_hi=q_hi.copy(),
                     std_action=std_action.copy(),
-                    intv_lo=intv_lo.copy(),
-                    intv_hi=intv_hi.copy(),
+                    intv_lo=intv_lo.copy() if intv_lo is not None else None,
+                    intv_hi=intv_hi.copy() if intv_hi is not None else None,
                 ))
                 if done:
                     screen_state = "done"
@@ -796,9 +951,14 @@ def run_rollout(env, n_rollout, ensemble):
 def run_study():
     # ── user inputs ───────────────────────────────
     shape_map  = {"1": "square", "2": "triangle", "3": "zigzag", "4": "swirl"}
-    method_map = {"1": METHOD_CONFORMAL_ENSEMBLE, "2": METHOD_CONFORMAL, "3": METHOD_ENSEMBLE}
+    method_map = {
+        "1": METHOD_CONFORMAL_ENSEMBLE,
+        "2": METHOD_CONFORMAL,
+        "3": METHOD_ENSEMBLE,
+        "4": METHOD_LAZYDAGGER,
+    }
     shape        = shape_map[input("Shape  1=square  2=triangle  3=zigzag  4=swirl: ").strip()]
-    method       = method_map[input("Method  1=conformal++  2=conformal  3=ensemble:").strip()]
+    method       = method_map[input("Method  1=conformal++  2=conformal  3=ensemble  4=lazydagger: ").strip()]
     N            = int(input("Episodes per round (N): "))
     M            = int(input("Number of rounds (M): "))
     N_EXPERT     = int(input("Expert reference episodes to collect before study (N_expert): "))
@@ -806,8 +966,8 @@ def run_study():
 
     # ── paths ─────────────────────────────────────
     study_model_dir = "trained_policy/study"
-    # conformal uses a single policy; conformal++ and ensemble use a full ensemble
-    n_init_members = 1 if method == METHOD_CONFORMAL else N_ENSEMBLE
+    # conformal and lazydagger use a single policy; conformal++ and ensemble use a full ensemble
+    n_init_members = 1 if method in (METHOD_CONFORMAL, METHOD_LAZYDAGGER) else N_ENSEMBLE
     init_policy_paths = [
         f"trained_policy/ensemble/cont_policy_{shape}20hz_{i+1}.pth"
         for i in range(n_init_members)
@@ -839,7 +999,14 @@ def run_study():
     print(f"  Buffer initialized with {len(episode_buffer)} base episodes (BUFFER_SIZE={BUFFER_SIZE})")
 
     # load initial model(s)
-    ensemble = load_ensemble(init_policy_paths, init_stats_paths)
+    policy_list = load_ensemble(init_policy_paths, init_stats_paths)
+    if method == METHOD_LAZYDAGGER:
+        clf_init_path   = "trained_safety_classifier/safety_classifier.pth"
+        clf_init_stats  = "trained_safety_classifier/norm_stats_safety_classifier.npz"
+        ensemble = (policy_list, load_lazydagger_classifier(clf_init_path, clf_init_stats))
+        print(f"  Loaded initial safety classifier from {clf_init_path}")
+    else:
+        ensemble = policy_list
     print(f"  Loaded initial model ({n_init_members} member(s), method={method})")
 
     # ── collect expert reference episodes (once, before any rounds) ────
@@ -887,14 +1054,19 @@ def run_study():
             sub="Please wait — this may take a few minutes",
         )
         print(f"\n  Retraining after round {round_idx + 1}…")
+        n_members = 1 if method in (METHOD_CONFORMAL, METHOD_LAZYDAGGER) else N_ENSEMBLE
         new_policy_paths, new_stats_path = retrain_policy(
             episode_buffer=episode_buffer,
             round_idx=round_idx,
             output_dir=study_model_dir,
+            n_members=n_members,
         )
-        # all retrained members share the same norm stats
-        n_members = 1 if method == METHOD_CONFORMAL else N_ENSEMBLE
-        ensemble = load_ensemble(new_policy_paths[:n_members], [new_stats_path] * n_members)
+        policy_list = load_ensemble(new_policy_paths[:n_members], [new_stats_path] * n_members)
+        if method == METHOD_LAZYDAGGER:
+            clf_path = train_lazydagger_classifier(episode_buffer, study_model_dir, round_idx, new_stats_path)
+            ensemble = (policy_list, load_lazydagger_classifier(clf_path, new_stats_path))
+        else:
+            ensemble = policy_list
         pygame.event.clear()   # flush events queued during retraining (no pump was called)
 
     # ── study complete ────────────────────────────
