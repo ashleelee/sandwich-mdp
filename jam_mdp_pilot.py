@@ -24,7 +24,7 @@ BUFFER_SIZE = 30
 N_ENSEMBLE  = 3
 UNCERTAINTY_THRESHOLD_ENSEMBLE  = 6.73
 UNCERTAINTY_THRESHOLD_CONFORMAL = 56.4255
-UNCERTAINTY_THRESHOLD_CONFORMAL_ENSEMBLE = 40
+UNCERTAINTY_THRESHOLD_CONFORMAL_ENSEMBLE = 6.73 
 UNCERTAINTY_THRESHOLD_ENSEMBLE_CLASSIFIER = 1.0   # normalized composite: >1.0 → need help
 STEP_SLEEP  = 1 / 20   # seconds between steps
 
@@ -537,6 +537,40 @@ def show_message_screen(screen, lines, sub=None):
     _draw_overlay(screen, lines, sub)
 
 
+def wait_for_yes_no(screen, lines):
+    """Draw overlay with YES / NO buttons. Returns True for YES, False for NO."""
+    font_big = pygame.font.SysFont("Arial", 34, bold=True)
+    font_btn = pygame.font.SysFont("Arial", 26, bold=True)
+    yes_rect = pygame.Rect(225, 360, 150, 52)
+    no_rect  = pygame.Rect(525, 360, 150, 52)
+
+    while True:
+        screen.fill((30, 30, 30))
+        y = 180
+        for line in lines:
+            surf = font_big.render(line, True, (255, 255, 255))
+            screen.blit(surf, surf.get_rect(center=(450, y)))
+            y += 60
+        for label, color, rect in [
+            ("YES", (60, 150, 60), yes_rect),
+            ("NO",  (150, 60, 60), no_rect),
+        ]:
+            pygame.draw.rect(screen, color, rect, border_radius=8)
+            surf = font_btn.render(label, True, (255, 255, 255))
+            screen.blit(surf, surf.get_rect(center=rect.center))
+        pygame.display.flip()
+
+        for event in pygame.event.get():
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if yes_rect.collidepoint(event.pos):
+                    return True
+                if no_rect.collidepoint(event.pos):
+                    return False
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                raise SystemExit
+
+
 def wait_for_space(screen, lines, sub="Press SPACE to continue"):
     """Blocking: draw message and wait until SPACE is pressed."""
     _draw_overlay(screen, lines, sub)
@@ -703,6 +737,19 @@ def run_round(env, N, M, round_idx, global_ep_offset, ensemble, method=METHOD_CO
                         dist         = float(np.linalg.norm(robot_prediction - action))
                         ensemble_unc = np.linalg.norm(std_action)
                         if dist < LAZYDAGGER_BETA_H and ensemble_unc < UNCERTAINTY_THRESHOLD_ENSEMBLE:
+                            screen_state = "robot"
+                            env.prediction_overlay = None
+                
+                elif method == METHOD_ENSEMBLE:
+                    # In human mode: exit when BOTH
+                    #   (1) ‖robot_pred − human‖ < 56.4255  (action distance safe)
+                    #   (2) ensemble std norm < 6.73          (ensemble not too uncertain)
+                    action       = env.get_help()
+                    human_action = action
+
+                    if action is not None:
+                        ensemble_unc = np.linalg.norm(std_action)
+                        if ensemble_unc < UNCERTAINTY_THRESHOLD_ENSEMBLE:
                             screen_state = "robot"
                             env.prediction_overlay = None
 
@@ -902,16 +949,17 @@ def collect_expert_episodes(env, n_episodes, save_path):
 # Final rollout
 # ──────────────────────────────────────────────────────────────
 
-def run_rollout(env, n_rollout, ensemble):
+def run_rollout(env, n_rollout, ensemble, method=None):
     """
     Run n_rollout episodes autonomously with the final policy.
     No human interventions, no IQT help requests — robot acts every step.
-    IQT bounds are still tracked and shown on the uncertainty graph.
     """
     print(f"\n{'='*55}")
     print(f"  FINAL ROLLOUT  —  {n_rollout} episodes  (robot only)")
     print(f"{'='*55}")
 
+    # classifier-based methods wrap the policy list in a tuple
+    policy_list = ensemble[0] if isinstance(ensemble, tuple) else ensemble
     total_rollout = n_rollout
 
     for ep in range(n_rollout):
@@ -951,7 +999,7 @@ def run_rollout(env, n_rollout, ensemble):
                 stuck_count = 0
 
             # robot prediction (ensemble mean; std not used in rollout)
-            action, _ = get_ensemble_prediction(obs, obs_prev1, obs_prev2, ensemble)
+            action, _ = get_ensemble_prediction(obs, obs_prev1, obs_prev2, policy_list)
 
             if stuck_count >= 13:
                 sigma = 15.0
@@ -996,6 +1044,251 @@ def run_rollout(env, n_rollout, ensemble):
 
         print(f"  Rollout episode {ep + 1} complete ({step_id} steps).")
         controlled_delay(3000)
+
+
+# ──────────────────────────────────────────────────────────────
+# Human evaluation stage
+# ──────────────────────────────────────────────────────────────
+
+EVAL_STOP_INTERVAL = 40   # steps between forced stops in comparison rollout
+
+
+def _eval_policy_list(ensemble, method):
+    """Extract policy list from ensemble (handles classifier-based methods)."""
+    return ensemble[0] if method in (METHOD_LAZYDAGGER, METHOD_ENSEMBLE_CLASSIFIER) else ensemble
+
+
+def run_rating_rollout(env, n_episodes, ensemble, method):
+    """
+    Autonomous robot rollout; human rates each episode Yes/No after it finishes.
+    Returns list of (episode_idx, True/False) tuples.
+    """
+    policy_list = _eval_policy_list(ensemble, method)
+    ratings = []
+    env.can_intervene = False
+
+    for ep in range(n_episodes):
+        wait_for_space(
+            env.screen,
+            [f"Rating  {ep + 1} / {n_episodes}", "Watch the robot. Rate when it finishes."],
+            sub="Press SPACE to start",
+        )
+
+        obs, _ = env.reset()
+        obs_prev1 = obs.copy()
+        obs_prev2 = obs.copy()
+        done = False
+        screen_state = "start"
+        step_id = 0
+        stuck_count = 0
+        uncertainty_hist = []
+
+        env.help_remaining_time = 0.0
+        env.render(ep, step_id, screen_state, n_episodes)
+        print(f"\n[Eval rating ep {ep + 1}/{n_episodes}]")
+
+        while not done:
+            if screen_state == "start":
+                if env.check_button_click():
+                    screen_state = "robot"
+                continue
+
+            if similar_state(obs, obs_prev1):
+                stuck_count += 1
+            else:
+                stuck_count = 0
+
+            action, _ = get_ensemble_prediction(obs, obs_prev1, obs_prev2, policy_list)
+
+            if stuck_count >= 13:   sigma = 15.0
+            elif stuck_count >= 10: sigma = 10.0
+            elif stuck_count >= 7:  sigma = 5.0
+            else:                   sigma = 0.0
+            if sigma > 0.0:
+                noise = np.random.normal(0.0, sigma, 2)
+                action[0] += noise[0]; action[1] += noise[1]
+
+            action[0] = np.clip(action[0], 0.0, 700.0)
+            action[1] = np.clip(action[1], 0.0, 700.0)
+            valid_gripper = np.array([0.0, 0.5, 1.0])
+            action[2] = valid_gripper[np.argmin(np.abs(valid_gripper - action[2]))]
+
+            uncertainty_hist.append(0.0)
+            if len(uncertainty_hist) > 150:
+                uncertainty_hist = uncertainty_hist[-150:]
+            env.uncertainty_history = uncertainty_hist
+
+            pygame.event.pump()
+            obs_prev2 = obs_prev1.copy()
+            obs_prev1 = obs.copy()
+            obs, _, done, _, _ = env.step(action)
+            if done:
+                screen_state = "done"
+            env.render(ep, step_id, screen_state, n_episodes)
+            step_id += 1
+            time.sleep(STEP_SLEEP)
+
+        controlled_delay(500)
+        rating = wait_for_yes_no(env.screen, ["Did the robot complete", "the task as desired?"])
+        ratings.append((ep, rating))
+        print(f"  Rating: {'YES' if rating else 'NO'}")
+        controlled_delay(1000)
+
+    return ratings
+
+
+def run_comparison_rollout(env, n_episodes, ensemble, method, n_stops=3):
+    """
+    Robot rollout with n_stops forced human-takeover segments at evenly-spaced steps.
+    For each segment, records (robot_pred, human_action) per step.
+    Human presses SPACE to end each segment and return control to the robot.
+    Returns list of per-episode dicts: {"episode", "segments": [[{step, robot_pred, human_action}...]...]}.
+    """
+    policy_list = _eval_policy_list(ensemble, method)
+    all_comparisons = []
+    env.can_intervene = False
+    stop_steps = [(s + 1) * EVAL_STOP_INTERVAL for s in range(n_stops)]
+
+    for ep in range(n_episodes):
+        wait_for_space(
+            env.screen,
+            [f"Comparison  {ep + 1} / {n_episodes}", f"Robot pauses {n_stops}x — take over briefly each time."],
+            sub="Press SPACE to begin",
+        )
+
+        obs, _ = env.reset()
+        obs_prev1 = obs.copy()
+        obs_prev2 = obs.copy()
+        done = False
+        screen_state = "start"
+        step_id = 0
+        stuck_count = 0
+        stop_idx = 0
+        ep_segments = []
+        current_segment = []
+        uncertainty_hist = []
+
+        env.help_remaining_time = 0.0
+        env.render(ep, step_id, screen_state, n_episodes)
+        print(f"\n[Eval comparison ep {ep + 1}/{n_episodes}]  stops at steps {stop_steps}")
+
+        while not done:
+            if screen_state == "start":
+                if env.check_button_click():
+                    screen_state = "robot"
+                continue
+
+            if screen_state == "ready_help":
+                if env.ready_to_help():
+                    screen_state = "help"
+                    current_segment = []
+                else:
+                    env.render(ep, step_id, screen_state, n_episodes)
+                    time.sleep(STEP_SLEEP)
+                    continue
+
+            if similar_state(obs, obs_prev1):
+                stuck_count += 1
+            else:
+                stuck_count = 0
+
+            action, _ = get_ensemble_prediction(obs, obs_prev1, obs_prev2, policy_list)
+
+            if stuck_count >= 13:   sigma = 15.0
+            elif stuck_count >= 10: sigma = 10.0
+            elif stuck_count >= 7:  sigma = 5.0
+            else:                   sigma = 0.0
+            if sigma > 0.0:
+                noise = np.random.normal(0.0, sigma, 2)
+                action[0] += noise[0]; action[1] += noise[1]
+
+            robot_prediction = action.copy()
+            robot_prediction[0] = np.clip(robot_prediction[0], 0.0, 700.0)
+            robot_prediction[1] = np.clip(robot_prediction[1], 0.0, 700.0)
+            valid_gripper = np.array([0.0, 0.5, 1.0])
+            robot_prediction[2] = valid_gripper[np.argmin(np.abs(valid_gripper - robot_prediction[2]))]
+
+            exec_action = robot_prediction.copy()
+
+            uncertainty_hist.append(0.0)
+            if len(uncertainty_hist) > 150:
+                uncertainty_hist = uncertainty_hist[-150:]
+            env.uncertainty_history = uncertainty_hist
+
+            if screen_state == "robot":
+                if stop_idx < n_stops and step_id >= stop_steps[stop_idx]:
+                    screen_state = "ready_help"
+                    stop_idx += 1
+
+            elif screen_state == "help":
+                human_action = env.get_help()
+                if human_action is not None:
+                    exec_action = human_action.copy()
+                    current_segment.append({
+                        "step":         step_id,
+                        "robot_pred":   robot_prediction.copy(),
+                        "human_action": human_action.copy(),
+                    })
+
+                if pygame.event.peek(pygame.KEYDOWN):
+                    for event in pygame.event.get(pygame.KEYDOWN):
+                        if event.key == pygame.K_SPACE:
+                            ep_segments.append(current_segment)
+                            current_segment = []
+                            screen_state = "robot"
+                            print(f"    Segment {len(ep_segments)} ended: {len(ep_segments[-1])} steps")
+
+            obs_prev2 = obs_prev1.copy()
+            obs_prev1 = obs.copy()
+            obs, _, done, _, _ = env.step(exec_action)
+            if done:
+                if current_segment:
+                    ep_segments.append(current_segment)
+                screen_state = "done"
+            env.render(ep, step_id, screen_state, n_episodes)
+            step_id += 1
+            time.sleep(STEP_SLEEP)
+
+        all_comparisons.append({"episode": ep, "segments": ep_segments})
+        print(f"  Comparison ep {ep}: {len(ep_segments)} segments, "
+              f"{sum(len(s) for s in ep_segments)} comparison steps")
+        controlled_delay(3000)
+
+    return all_comparisons
+
+
+def run_evaluation(env, ensemble, method, n_rating=3, n_comparison=2):
+    """
+    Human evaluation stage:
+      1. Rating: human watches n_rating autonomous rollouts and clicks Yes/No.
+      2. Comparison: robot pauses 3x per episode for n_comparison episodes;
+         human takes over each segment (SPACE to end), robot pred vs human action recorded.
+    Results saved to data/study/eval_results.pkl.
+    """
+    print(f"\n{'='*55}")
+    print(f"  EVALUATION  —  {n_rating} rating + {n_comparison} comparison episode(s)")
+    print(f"{'='*55}")
+
+    wait_for_space(
+        env.screen,
+        ["Evaluation  —  Part 1", f"Rate {n_rating} robot rollout(s): Yes or No"],
+        sub="Press SPACE to begin",
+    )
+    ratings = run_rating_rollout(env, n_rating, ensemble, method)
+
+    wait_for_space(
+        env.screen,
+        ["Evaluation  —  Part 2", f"{n_comparison} rollout(s) with {3} pauses each"],
+        sub="Press SPACE to begin",
+    )
+    comparisons = run_comparison_rollout(env, n_comparison, ensemble, method)
+
+    results = {"method": method, "ratings": ratings, "comparisons": comparisons}
+    save_path = "data/study/eval_results.pkl"
+    with open(save_path, "wb") as f:
+        pickle.dump(results, f)
+    print(f"\n  Saved evaluation results → {save_path}")
+    return results
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1121,12 +1414,7 @@ def run_study():
     # ── study complete ────────────────────────────
     print(f"\nStudy complete: {N * M} total episodes across {M} rounds.")
 
-    wait_for_space(
-        env.screen,
-        ["Study complete!", "Final rollout coming up…"],
-        sub="Press SPACE to begin rollout",
-    )
-    run_rollout(env, 1, ensemble=ensemble)
+    run_evaluation(env, ensemble=ensemble, method=method, n_rating=1, n_comparison=1)
 
     wait_for_space(
         env.screen,
